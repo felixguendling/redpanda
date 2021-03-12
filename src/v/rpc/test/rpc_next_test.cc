@@ -17,27 +17,40 @@
 
 #include <chrono>
 
-struct test_msg
-  : rpc::envelope<test_msg, rpc::version<4>, rpc::compat_version<0>> {
-    std::string _body;
-    std::vector<uint32_t> _data;
+struct test_msg0
+  : rpc::envelope<test_msg0, rpc::version<1>, rpc::compat_version<0>> {
+    char _i, _j;
+};
+
+struct test_msg1
+  : rpc::envelope<test_msg1, rpc::version<4>, rpc::compat_version<0>> {
+    int _a;
+    test_msg0 _m;
+    int _b, _c;
+
+    //    std::string _body;
+    //    std::vector<uint32_t> _data;
 };
 
 struct not_an_envelope {};
 static_assert(!rpc::is_envelope_v<not_an_envelope>);
-static_assert(rpc::is_envelope_v<test_msg>);
-static_assert(test_msg::version == 4);
-static_assert(test_msg::compat_version == 0);
+static_assert(rpc::is_envelope_v<test_msg1>);
+static_assert(test_msg1::version == 4);
+static_assert(test_msg1::compat_version == 0);
 
 SEASTAR_THREAD_TEST_CASE(envelope_test) {
     auto b = iobuf();
 
-    rpc::write(b, test_msg{._body = "Hello World", ._data = {1, 2, 3}});
+    rpc::write(
+      b, test_msg1{._a = 55, ._m = {._i = 'i', ._j = 'j'}, ._b = 33, ._c = 44});
 
     auto parser = iobuf_parser{std::move(b)};
 
-    auto m = test_msg{};
-    BOOST_CHECK_NO_THROW(m = rpc::read<test_msg>(parser););
-    //    BOOST_CHECK(m._body == "Hello World");
-    //    BOOST_CHECK((m._data == std::vector<uint32_t>{1, 2, 3}));
+    auto m = rpc::read<test_msg1>(parser);
+    BOOST_CHECK(m.has_value());
+    BOOST_CHECK(m.value()._a == 55);
+    BOOST_CHECK(m.value()._b == 33);
+    BOOST_CHECK(m.value()._c == 44);
+    BOOST_CHECK(m.value()._m._i == 'i');
+    BOOST_CHECK(m.value()._m._j == 'j');
 }

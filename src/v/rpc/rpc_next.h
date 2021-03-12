@@ -12,8 +12,10 @@
 #pragma once
 
 #include "bytes/iobuf_parser.h"
+#include "outcome.h"
 #include "reflection/for_each_field.h"
 #include "rpc/logger.h"
+#include "utils/vint.h"
 
 #include <iosfwd>
 #include <string>
@@ -115,6 +117,8 @@ inline auto envelope_to_tuple(T& t) {
     }
 }
 
+enum class envelope_for_each_field_result : uint8_t { BREAK, CONTINUE };
+
 template<typename T, typename Fn>
 inline void envelope_for_each_field(T& t, Fn&& fn) {
     if constexpr (std::is_pointer_v<T>) {
@@ -125,7 +129,10 @@ inline void envelope_for_each_field(T& t, Fn&& fn) {
         fn(t);
     } else {
         std::apply(
-          [&](auto&&... args) { (fn(args), ...); }, envelope_to_tuple(t));
+          [&](auto&&... args) {
+              (void)((fn(args) == envelope_for_each_field_result::CONTINUE) && ...);
+          },
+          envelope_to_tuple(t));
     }
 }
 
@@ -185,26 +192,6 @@ struct envelope {
     using value_t = T;
     static constexpr auto version = Version::v;
     static constexpr auto compat_version = CompatVersion::v;
-
-    //    template<typename Encoder>
-    //    void write(Encoder& s) const {
-    //        write(*static_cast<value_t const*>(this), s);
-    //    }
-    //
-    //    template<typename Decoder>
-    //    void read(Decoder& d) {
-    //        read(*static_cast<value_t*>(this), d);
-    //    }
-    //
-    //    template<typename Encoder>
-    //    ss::future<> async_write(Encoder& s) const {
-    //        async_write(*static_cast<value_t const*>(this), s);
-    //    }
-    //
-    //    template<typename Decoder>
-    //    ss::future<> async_read(Decoder& d) {
-    //        async_read(*static_cast<value_t*>(this), d);
-    //    }
 };
 
 template<typename T>
@@ -228,38 +215,88 @@ template<typename T>
 void write(iobuf& out, T const& el) {
     using Type = std::decay_t<T>;
     if constexpr (is_envelope_v<T>) {
+        auto size_buf = std::array<uint8_t, 1>{};
+        auto const size_size = vint::serialize(sizeof(T), &size_buf[0]);
+        out.append(&size_buf[0], size_size);
+
         write(out, T::version);
         write(out, T::compat_version);
-        envelope_for_each_field(el, [&out](auto& f) { write(out, f); });
+
+        envelope_for_each_field(el, [&out](auto& f) {
+            write(out, f);
+            return envelope_for_each_field_result::CONTINUE;
+        });
     } else if constexpr (std::is_scalar_v<Type>) {
         auto le_t = ss::cpu_to_le(el);
         out.append(reinterpret_cast<const char*>(&le_t), sizeof(Type));
     }
 }
 
-template<typename T>
-T read(iobuf_parser& in) {
-    using Type = std::decay_t<T>;
-    T t{};
-    if constexpr (is_envelope_v<Type>) {
-        // Check version.
-        if (auto const v = read<version_t>(in); v > T::version) {
-            rpclog.error(
-              "version={} does not match {}::version={}\n",
-              static_cast<int>(v),
-              cista::type_str<T>(),
-              static_cast<int>(T::version));
-            throw std::runtime_error{"invalid version"};
+enum class rpc_error_codes : int {
+    version_older_than_compat_version,
+    message_too_short
+};
+
+struct rpc_error_category final : std::error_category {
+    const char* name() const noexcept final { return "rpc"; }
+    std::string message(int ec) const final {
+        switch (static_cast<rpc_error_codes>(ec)) {
+        case rpc_error_codes::version_older_than_compat_version:
+            return "Code message version is older than compatability version.";
+        case rpc_error_codes::message_too_short:
+            return "Message length shorter than communicated message length.";
         }
+        return "unknown";
+    }
+};
+
+std::error_code make_error_code(rpc_error_codes ec) noexcept {
+    static rpc_error_category ecat;
+    return {static_cast<int>(ec), ecat};
+}
+
+template<typename T>
+checked<T> read(iobuf_parser& in) {
+    using Type = std::decay_t<T>;
+    auto t = checked<Type>{Type{}};
+    if constexpr (is_envelope_v<Type>) {
+        // Read envelope header: version, compat version and size.
+
+        // currently unused - could be used to drop data from
+        BOOST_OUTCOME_TRY(version, read<version_t>(in));
+        BOOST_OUTCOME_TRY(compat_version, read<version_t>(in));
+        auto const [size, size_size] = in.read_varlong();
 
         // Check compat version.
-        if (auto const v = read<version_t>(in); v < T::compat_version) {
+        if (compat_version > T::version) {
             rpclog.error(
-              "compat_version={} does not match {}::compat_version={}\n",
-              static_cast<int>(v),
+              "read compat_version={} > {}::version={}\n ",
+              static_cast<int>(compat_version),
               cista::type_str<T>(),
               static_cast<int>(T::version));
-            throw std::runtime_error{"invalid compat version"};
+            return make_error_code(
+              rpc_error_codes::version_older_than_compat_version);
+        }
+
+        if (in.bytes_left() < size) {
+            return make_error_code(rpc_error_codes::message_too_short);
+        }
+
+        auto ec = std::error_code{};
+        envelope_for_each_field(
+          t.value(), [&](auto& field) -> envelope_for_each_field_result {
+              using MemberType = std::decay_t<decltype(field)>;
+              auto const parsed = read<MemberType>(in);
+              if (!parsed.has_value()) {
+                  ec = parsed.error();
+                  return envelope_for_each_field_result::BREAK;
+              } else {
+                  field = std::move(parsed.value());
+                  return envelope_for_each_field_result::CONTINUE;
+              }
+          });
+        if (ec) {
+            return ec;
         }
     } else if constexpr (std::is_scalar_v<Type>) {
         t = ss::le_to_cpu(in.consume_type<Type>());
