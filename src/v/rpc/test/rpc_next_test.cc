@@ -27,9 +27,13 @@ struct test_msg1
     int _a;
     test_msg0 _m;
     int _b, _c;
+};
 
-    //    std::string _body;
-    //    std::vector<uint32_t> _data;
+struct test_msg1_new
+  : rpc::envelope<test_msg1, rpc::version<10>, rpc::compat_version<5>> {
+    int _a;
+    test_msg0 _m;
+    int _b, _c;
 };
 
 struct not_an_envelope {};
@@ -53,4 +57,37 @@ SEASTAR_THREAD_TEST_CASE(envelope_test) {
     BOOST_CHECK(m.value()._c == 44);
     BOOST_CHECK(m.value()._m._i == 'i');
     BOOST_CHECK(m.value()._m._j == 'j');
+}
+
+SEASTAR_THREAD_TEST_CASE(envelope_test_version_older_than_compat_version) {
+    auto b = iobuf();
+
+    rpc::write(
+      b,
+      test_msg1_new{
+        ._a = 55, ._m = {._i = 'i', ._j = 'j'}, ._b = 33, ._c = 44});
+
+    auto parser = iobuf_parser{std::move(b)};
+
+    auto m = rpc::read<test_msg1>(parser);
+    BOOST_CHECK(m.has_error());
+    BOOST_CHECK(
+      m.error().value()
+      == static_cast<int>(
+        rpc::rpc_error_codes::version_older_than_compat_version));
+}
+
+SEASTAR_THREAD_TEST_CASE(envelope_test_buffer_too_short) {
+    auto b = iobuf();
+
+    rpc::write(
+      b,
+      test_msg1_new{
+        ._a = 55, ._m = {._i = 'i', ._j = 'j'}, ._b = 33, ._c = 44});
+
+    b.pop_back(); // introduce length mismatch
+    auto parser = iobuf_parser{std::move(b)};
+
+    auto m = rpc::read<test_msg1>(parser);
+    BOOST_CHECK(m.has_exception());
 }

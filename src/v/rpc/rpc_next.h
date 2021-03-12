@@ -256,52 +256,58 @@ std::error_code make_error_code(rpc_error_codes ec) noexcept {
 }
 
 template<typename T>
-checked<T> read(iobuf_parser& in) {
-    using Type = std::decay_t<T>;
-    auto t = checked<Type>{Type{}};
-    if constexpr (is_envelope_v<Type>) {
-        // Read envelope header: version, compat version and size.
+outcome::outcome<std::decay_t<T>, std::error_code, std::exception_ptr>
+read(iobuf_parser& in) {
+    try {
+        using Type = std::decay_t<T>;
+        auto t = outcome::outcome<Type, std::error_code, std::exception_ptr>{
+          Type{}};
+        if constexpr (is_envelope_v<Type>) {
+            // Read envelope header: version, compat version and size.
 
-        // currently unused - could be used to drop data from
-        BOOST_OUTCOME_TRY(version, read<version_t>(in));
-        BOOST_OUTCOME_TRY(compat_version, read<version_t>(in));
-        auto const [size, size_size] = in.read_varlong();
+            // currently unused - could be used to drop data from
+            BOOST_OUTCOME_TRY(version, read<version_t>(in));
+            BOOST_OUTCOME_TRY(compat_version, read<version_t>(in));
+            auto const [size, size_size] = in.read_varlong();
 
-        // Check compat version.
-        if (compat_version > T::version) {
-            rpclog.error(
-              "read compat_version={} > {}::version={}\n ",
-              static_cast<int>(compat_version),
-              cista::type_str<T>(),
-              static_cast<int>(T::version));
-            return make_error_code(
-              rpc_error_codes::version_older_than_compat_version);
+            // Check compat version.
+            if (compat_version > T::version) {
+                rpclog.error(
+                  "read compat_version={} > {}::version={}\n ",
+                  static_cast<int>(compat_version),
+                  cista::type_str<T>(),
+                  static_cast<int>(T::version));
+                return make_error_code(
+                  rpc_error_codes::version_older_than_compat_version);
+            }
+
+            if (in.bytes_left() < size) {
+                return make_error_code(rpc_error_codes::message_too_short);
+            }
+
+            auto ec = std::error_code{};
+            envelope_for_each_field(
+              t.value(), [&](auto& field) -> envelope_for_each_field_result {
+                  using MemberType = std::decay_t<decltype(field)>;
+                  auto const parsed = read<MemberType>(in);
+                  if (!parsed.has_value()) {
+                      ec = parsed.error();
+                      return envelope_for_each_field_result::BREAK;
+                  } else {
+                      field = std::move(parsed.value());
+                      return envelope_for_each_field_result::CONTINUE;
+                  }
+              });
+            if (ec) {
+                return ec;
+            }
+        } else if constexpr (std::is_scalar_v<Type>) {
+            t = ss::le_to_cpu(in.consume_type<Type>());
         }
-
-        if (in.bytes_left() < size) {
-            return make_error_code(rpc_error_codes::message_too_short);
-        }
-
-        auto ec = std::error_code{};
-        envelope_for_each_field(
-          t.value(), [&](auto& field) -> envelope_for_each_field_result {
-              using MemberType = std::decay_t<decltype(field)>;
-              auto const parsed = read<MemberType>(in);
-              if (!parsed.has_value()) {
-                  ec = parsed.error();
-                  return envelope_for_each_field_result::BREAK;
-              } else {
-                  field = std::move(parsed.value());
-                  return envelope_for_each_field_result::CONTINUE;
-              }
-          });
-        if (ec) {
-            return ec;
-        }
-    } else if constexpr (std::is_scalar_v<Type>) {
-        t = ss::le_to_cpu(in.consume_type<Type>());
+        return t;
+    } catch (...) {
+        return std::current_exception();
     }
-    return t;
 }
 
 /* TODO(felix) write/read JSON?
