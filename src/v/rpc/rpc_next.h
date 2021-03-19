@@ -12,12 +12,13 @@
 #pragma once
 
 #include "bytes/iobuf_parser.h"
-#include "outcome.h"
 #include "reflection/for_each_field.h"
 #include "rpc/logger.h"
+#include "utils/named_type.h"
 #include "utils/vint.h"
 
 #include <iosfwd>
+#include <numeric>
 #include <string>
 #include <string_view>
 
@@ -92,8 +93,11 @@ constexpr std::size_t arity() {
 template<typename T>
 inline auto envelope_to_tuple(T& t) {
     constexpr auto const a = arity<T>() - 1;
-    static_assert(a <= 64, "Max. supported members: 64");
-    if constexpr (a == 2) {
+    static_assert(a <= 8, "Max. supported members: 64");
+    if constexpr (a == 1) {
+        auto& [p1] = t;
+        return std::tie(p1);
+    } else if constexpr (a == 2) {
         auto& [p1, p2] = t;
         return std::tie(p1, p2);
     } else if constexpr (a == 3) {
@@ -114,25 +118,6 @@ inline auto envelope_to_tuple(T& t) {
     } else if constexpr (a == 8) {
         auto& [p1, p2, p3, p4, p5, p6, p7, p8] = t;
         return std::tie(p1, p2, p3, p4, p5, p6, p7, p8);
-    }
-}
-
-enum class envelope_for_each_field_result : uint8_t { BREAK, CONTINUE };
-
-template<typename T, typename Fn>
-inline void envelope_for_each_field(T& t, Fn&& fn) {
-    if constexpr (std::is_pointer_v<T>) {
-        if (t != nullptr) {
-            envelope_for_each_field(*t, std::forward<Fn>(fn));
-        }
-    } else if constexpr (std::is_scalar_v<T>) {
-        fn(t);
-    } else {
-        std::apply(
-          [&](auto&&... args) {
-              (void)((fn(args) == envelope_for_each_field_result::CONTINUE) && ...);
-          },
-          envelope_to_tuple(t));
     }
 }
 
@@ -211,24 +196,88 @@ struct is_envelope<T, std::void_t<decltype(std::declval<T>().compat_version)>>
 template<typename T>
 inline constexpr auto const is_envelope_v = is_envelope<T>::value;
 
+template<typename T, typename Fn>
+inline void envelope_for_each_field(T& t, Fn&& fn) {
+    static_assert(is_envelope_v<std::decay_t<T>>);
+    std::apply([&](auto&&... args) { (fn(args), ...); }, envelope_to_tuple(t));
+}
+
+// START copied from adl.h
 template<typename T>
-void write(iobuf& out, T const& el) {
+struct is_std_vector : std::false_type {};
+template<typename... Args>
+struct is_std_vector<std::vector<Args...>> : std::true_type {};
+template<typename T>
+inline constexpr bool is_std_vector_v = is_std_vector<T>::value;
+
+template<typename T>
+struct is_std_optional : std::false_type {};
+template<typename... Args>
+struct is_std_optional<std::optional<Args...>> : std::true_type {};
+template<typename T>
+inline constexpr bool is_std_optional_v = is_std_optional<T>::value;
+
+template<typename T>
+struct is_named_type : std::false_type {};
+template<typename T, typename Tag>
+struct is_named_type<named_type<T, Tag>> : std::true_type {};
+template<typename T>
+inline constexpr bool is_named_type_v = is_named_type<T>::value;
+
+template<typename T>
+struct is_ss_bool : std::false_type {};
+template<typename T>
+struct is_ss_bool<ss::bool_class<T>> : std::true_type {};
+template<typename T>
+inline constexpr bool is_ss_bool_v = is_ss_bool<T>::value;
+// END copied from adl.h
+
+template<typename T>
+inline constexpr auto const is_serializable_v
+  = is_std_vector_v<T> || std::is_scalar_v<T> || is_envelope_v<T>;
+
+template<typename T>
+size_t binary_size(T const& t) {
     using Type = std::decay_t<T>;
+    static_assert(is_serializable_v<Type>);
     if constexpr (is_envelope_v<T>) {
-        auto size_buf = std::array<uint8_t, 1>{};
-        auto const size_size = vint::serialize(sizeof(T), &size_buf[0]);
+        auto sum = size_t{};
+        envelope_for_each_field(t, [&sum](auto& f) { sum += binary_size(f); });
+        return sum;
+    } else if constexpr (is_std_vector_v<Type>) {
+        auto sum = vint::vint_size(t.size());
+        for (auto const& el : t) {
+            sum += binary_size(el);
+        }
+        return sum;
+    } else if constexpr (std::is_scalar_v<Type>) {
+        return sizeof(Type);
+    }
+}
+
+template<typename T>
+void write(iobuf& out, T const& t) {
+    using Type = std::decay_t<T>;
+    static_assert(is_serializable_v<Type>);
+    if constexpr (is_envelope_v<Type>) {
+        auto size_buf = std::array<uint8_t, 9>{};
+        auto const size_size = vint::serialize(binary_size(t), &size_buf[0]);
         out.append(&size_buf[0], size_size);
 
         write(out, T::version);
         write(out, T::compat_version);
 
-        envelope_for_each_field(el, [&out](auto& f) {
-            write(out, f);
-            return envelope_for_each_field_result::CONTINUE;
-        });
+        envelope_for_each_field(t, [&out](auto& f) { write(out, f); });
     } else if constexpr (std::is_scalar_v<Type>) {
-        auto le_t = ss::cpu_to_le(el);
+        auto le_t = ss::cpu_to_le(t);
         out.append(reinterpret_cast<const char*>(&le_t), sizeof(Type));
+    } else if constexpr (is_std_vector_v<Type>) {
+        auto size_buf = std::array<uint8_t, 9>{};
+        auto const size_size = vint::serialize(binary_size(t), &size_buf[0]);
+        out.append(&size_buf[0], size_size);
+        for (auto const& el : t) {
+            write(out, el);
+        }
     }
 }
 
@@ -256,68 +305,44 @@ std::error_code make_error_code(rpc_error_codes ec) noexcept {
 }
 
 template<typename T>
-outcome::outcome<std::decay_t<T>, std::error_code, std::exception_ptr>
-read(iobuf_parser& in) {
-    try {
-        using Type = std::decay_t<T>;
-        auto t = outcome::outcome<Type, std::error_code, std::exception_ptr>{
-          Type{}};
-        if constexpr (is_envelope_v<Type>) {
-            // Read envelope header: version, compat version and size.
+std::decay_t<T> read(iobuf_parser& in) {
+    using Type = std::decay_t<T>;
+    auto t = Type();
 
-            // currently unused - could be used to drop data from
-            BOOST_OUTCOME_TRY(version, read<version_t>(in));
-            BOOST_OUTCOME_TRY(compat_version, read<version_t>(in));
-            auto const [size, size_size] = in.read_varlong();
-
-            // Check compat version.
-            if (compat_version > T::version) {
-                rpclog.error(
-                  "read compat_version={} > {}::version={}\n ",
-                  static_cast<int>(compat_version),
-                  cista::type_str<T>(),
-                  static_cast<int>(T::version));
-                return make_error_code(
-                  rpc_error_codes::version_older_than_compat_version);
-            }
-
-            if (in.bytes_left() < size) {
-                return make_error_code(rpc_error_codes::message_too_short);
-            }
-
-            auto ec = std::error_code{};
-            envelope_for_each_field(
-              t.value(), [&](auto& field) -> envelope_for_each_field_result {
-                  using MemberType = std::decay_t<decltype(field)>;
-                  auto const parsed = read<MemberType>(in);
-                  if (!parsed.has_value()) {
-                      ec = parsed.error();
-                      return envelope_for_each_field_result::BREAK;
-                  } else {
-                      field = std::move(parsed.value());
-                      return envelope_for_each_field_result::CONTINUE;
-                  }
-              });
-            if (ec) {
-                return ec;
-            }
-        } else if constexpr (std::is_scalar_v<Type>) {
-            t = ss::le_to_cpu(in.consume_type<Type>());
-        }
-        return t;
-    } catch (...) {
-        return std::current_exception();
+    if (in.bytes_left() < sizeof(Type)) {
+        throw std::system_error{
+          make_error_code(rpc_error_codes::message_too_short)};
     }
+
+    if constexpr (is_envelope_v<Type>) {
+        // Read envelope header: version, compat version, and size.
+        auto const version = read<version_t>(in);
+        auto const compat_version = read<version_t>(in);
+        auto const [size, size_size] = in.read_varlong();
+
+        (void)version;
+
+        if (compat_version > Type::version) {
+            rpclog.error(
+              "read compat_version={} > {}::version={}\n ",
+              static_cast<int>(compat_version),
+              cista::type_str<T>(),
+              static_cast<int>(Type::version));
+            throw std::system_error{make_error_code(
+              rpc_error_codes::version_older_than_compat_version)};
+        }
+
+        if (in.bytes_left() < size) {
+            throw std::system_error{
+              make_error_code(rpc_error_codes::message_too_short)};
+        }
+
+        envelope_for_each_field(
+          t, [&](auto& field) { field = read<decltype(field)>(in); });
+    } else if constexpr (std::is_scalar_v<Type>) {
+        t = ss::le_to_cpu(in.consume_type<Type>());
+    }
+    return t;
 }
-
-/* TODO(felix) write/read JSON?
-struct json_encoder {
-    std::ostream& _out;
-};
-
-struct json_decoder {
-    std::istream& _in;
-};
-*/
 
 } // namespace rpc
