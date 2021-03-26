@@ -14,6 +14,7 @@
 #include "bytes/iobuf_parser.h"
 #include "reflection/for_each_field.h"
 #include "rpc/logger.h"
+#include "ssx/future-util.h"
 #include "utils/named_type.h"
 #include "utils/vint.h"
 
@@ -236,51 +237,6 @@ template<typename T>
 inline constexpr auto const is_serializable_v
   = is_std_vector_v<T> || std::is_scalar_v<T> || is_envelope_v<T>;
 
-template<typename T>
-size_t binary_size(T const& t) {
-    using Type = std::decay_t<T>;
-    static_assert(is_serializable_v<Type>);
-    if constexpr (is_envelope_v<T>) {
-        auto sum = size_t{};
-        envelope_for_each_field(t, [&sum](auto& f) { sum += binary_size(f); });
-        return sum;
-    } else if constexpr (is_std_vector_v<Type>) {
-        auto sum = vint::vint_size(t.size());
-        for (auto const& el : t) {
-            sum += binary_size(el);
-        }
-        return sum;
-    } else if constexpr (std::is_scalar_v<Type>) {
-        return sizeof(Type);
-    }
-}
-
-template<typename T>
-void write(iobuf& out, T const& t) {
-    using Type = std::decay_t<T>;
-    static_assert(is_serializable_v<Type>);
-    if constexpr (is_envelope_v<Type>) {
-        auto size_buf = std::array<uint8_t, 9>{};
-        auto const size_size = vint::serialize(binary_size(t), &size_buf[0]);
-        out.append(&size_buf[0], size_size);
-
-        write(out, T::version);
-        write(out, T::compat_version);
-
-        envelope_for_each_field(t, [&out](auto& f) { write(out, f); });
-    } else if constexpr (std::is_scalar_v<Type>) {
-        auto le_t = ss::cpu_to_le(t);
-        out.append(reinterpret_cast<const char*>(&le_t), sizeof(Type));
-    } else if constexpr (is_std_vector_v<Type>) {
-        auto size_buf = std::array<uint8_t, 9>{};
-        auto const size_size = vint::serialize(binary_size(t), &size_buf[0]);
-        out.append(&size_buf[0], size_size);
-        for (auto const& el : t) {
-            write(out, el);
-        }
-    }
-}
-
 enum class rpc_error_codes : int {
     version_older_than_compat_version,
     message_too_short
@@ -304,23 +260,67 @@ std::error_code make_error_code(rpc_error_codes ec) noexcept {
     return {static_cast<int>(ec), ecat};
 }
 
-template<typename T>
-std::decay_t<T> read(iobuf_parser& in) {
+enum class mode { SYNC, ASYNC };
+
+template<
+  typename T,
+  mode M = mode::SYNC,
+  std::enable_if_t<M == mode::SYNC, void*> = nullptr>
+auto write(iobuf& out, T const& t)
+  -> std::conditional_t<M == mode::SYNC, void, ss::future<>> {
+    using Type = std::decay_t<T>;
+    static_assert(is_serializable_v<Type>);
+    if constexpr (is_envelope_v<Type>) {
+        write(out, Type::version);
+        write(out, Type::compat_version);
+
+        auto size_placeholder = out.reserve(vint::max_length);
+        auto const size_before = out.size_bytes();
+
+        envelope_for_each_field(t, [&out](auto& f) { write(out, f); });
+
+        auto const written_size = out.size_bytes() - size_before;
+        auto size_buf = std::array<uint8_t, vint::max_length>{};
+        auto const size_size = vint::serialize(written_size, &size_buf[0]);
+        size_placeholder.write(
+          reinterpret_cast<char const*>(&size_buf[0]), size_size);
+    } else if constexpr (std::is_scalar_v<Type>) {
+        auto le_t = ss::cpu_to_le(t);
+        out.append(reinterpret_cast<const char*>(&le_t), sizeof(Type));
+    } else if constexpr (is_std_vector_v<Type>) {
+        assert(t.size() <= std::numeric_limits<uint32_t>::max());
+        write(out, static_cast<uint32_t>(t.size()));
+        for (auto const& el : t) {
+            write(out, el);
+        }
+    }
+
+    if constexpr (M == mode::ASYNC) {
+        return ss::make_ready_future<>();
+    }
+}
+
+template<
+  typename T,
+  mode M = mode::SYNC,
+  std::enable_if_t<M == mode::SYNC, void*> = nullptr>
+auto read(iobuf_parser& in) -> std::
+  conditional_t<M == mode::SYNC, std::decay_t<T>, ss::future<std::decay_t<T>>> {
     using Type = std::decay_t<T>;
     auto t = Type();
-
-    if (in.bytes_left() < sizeof(Type)) {
-        throw std::system_error{
-          make_error_code(rpc_error_codes::message_too_short)};
-    }
 
     if constexpr (is_envelope_v<Type>) {
         // Read envelope header: version, compat version, and size.
         auto const version = read<version_t>(in);
         auto const compat_version = read<version_t>(in);
+        (void)version; // could be used to drop messages from old versions
+
         auto const [size, size_size] = in.read_varlong();
 
-        (void)version;
+        // TODO(felix) this should not be necessary (wasted bytes)
+        in.consume(vint::max_length - size_size, [](const char*, size_t) {
+            return ss::stop_iteration::no;
+        });
 
         if (compat_version > Type::version) {
             rpclog.error(
@@ -338,11 +338,38 @@ std::decay_t<T> read(iobuf_parser& in) {
         }
 
         envelope_for_each_field(
-          t, [&](auto& field) { field = read<decltype(field)>(in); });
+          t, [&](auto& f) { f = read<std::decay_t<decltype(f)>>(in); });
     } else if constexpr (std::is_scalar_v<Type>) {
+        if (in.bytes_left() < sizeof(Type)) {
+            throw std::system_error{
+              make_error_code(rpc_error_codes::message_too_short)};
+        }
+
         t = ss::le_to_cpu(in.consume_type<Type>());
+    } else if constexpr (is_std_vector_v<Type>) {
+        using value_type = typename Type::value_type;
+        t.resize(read<uint32_t>(in));
+        if constexpr (M == mode::SYNC) {
+            for (auto i = 0U; i < t.size(); ++i) {
+                t[i] = read<value_type>(in);
+            }
+        } else {
+            return ss::do_with(
+              boost::irange<size_t>(0, t.size()),
+              [&in, &t](const boost::integer_range<size_t>& r) {
+                  return ssx::async_transform(
+                    r.begin(), r.end(), [&in](size_t i) {
+                        t[i] = read<value_type, mode::ASYNC>(in);
+                    });
+              });
+        }
     }
-    return t;
+
+    if constexpr (M == mode::SYNC) {
+        return t;
+    } else {
+        return ss::make_ready_future<>(t);
+    }
 }
 
 } // namespace rpc
