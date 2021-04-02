@@ -77,11 +77,13 @@ void log_manager::trigger_housekeeping() {
 ss::future<> log_manager::stop() {
     _compaction_timer.cancel();
     _abort_source.request_abort();
-    return _open_gate.close().then([this] {
-        return ss::parallel_for_each(_logs, [](logs_type::value_type& entry) {
-            return entry.second.handle.close();
-        });
-    });
+    return _open_gate.close()
+      .then([this] {
+          return ss::parallel_for_each(_logs, [](logs_type::value_type& entry) {
+              return entry.second.handle.close();
+          });
+      })
+      .then([this] { return _batch_cache.stop(); });
 }
 
 static inline logs_type::iterator find_next_non_compacted_log(logs_type& logs) {
@@ -281,6 +283,14 @@ log_manager::get(const model::topic_namespace& tn) {
         if (p.first.ns == tn.ns && p.first.tp.topic == tn.tp) {
             r.emplace(p.first, p.second.handle);
         }
+    }
+    return r;
+}
+
+absl::flat_hash_set<model::ntp> log_manager::get_all_ntps() const {
+    absl::flat_hash_set<model::ntp> r;
+    for (const auto& p : _logs) {
+        r.insert(p.first);
     }
     return r;
 }

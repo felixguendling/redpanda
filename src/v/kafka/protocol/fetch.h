@@ -68,6 +68,7 @@ struct fetch_request final {
     int32_t session_epoch = final_fetch_session_epoch;      // >= v7
     std::vector<topic> topics;
     std::vector<forgotten_topic> forgotten_topics; // >= v7
+    ss::sstring rack_id;                           // >= v11 ignored
 
     void encode(response_writer& writer, api_version version);
     void decode(request_context& ctx);
@@ -217,6 +218,7 @@ struct fetch_response final {
         model::offset last_stable_offset;                      // >= v4
         model::offset log_start_offset;                        // >= v5
         std::vector<aborted_transaction> aborted_transactions; // >= v4
+        model::node_id preferred_read_replica{-1};             // >= v11 ignored
         std::optional<batch_reader> record_set;
         /*
          * _not part of kafka protocol
@@ -468,11 +470,11 @@ struct op_context {
 
 class partition_wrapper {
 public:
-    partition_wrapper(
+    explicit partition_wrapper(
       ss::lw_shared_ptr<cluster::partition> partition,
       std::optional<storage::log> log = std::nullopt)
-      : _partition(partition)
-      , _log(log) {}
+      : _partition(std::move(partition))
+      , _log(std::move(log)) {}
 
     ss::future<model::record_batch_reader>
     make_reader(storage::log_reader_config config) {
@@ -485,6 +487,11 @@ public:
     model::offset high_watermark() const {
         return _log ? _log->offsets().dirty_offset
                     : _partition->high_watermark();
+    }
+
+    model::offset start_offset() const {
+        // we have to access log directy when dealing with materialized partiton
+        return _log ? _log->offsets().start_offset : _partition->start_offset();
     }
 
     model::offset last_stable_offset() const {
@@ -511,18 +518,24 @@ struct read_result {
       : error(e) {}
 
     read_result(
-      model::record_batch_reader rdr, model::offset hw, model::offset lso)
+      model::record_batch_reader rdr,
+      model::offset start_offset,
+      model::offset hw,
+      model::offset lso)
       : reader(std::move(rdr))
+      , start_offset(start_offset)
       , high_watermark(hw)
       , last_stable_offset(lso)
       , error(error_code::none) {}
 
-    read_result(model::offset hw, model::offset lso)
-      : high_watermark(hw)
+    read_result(model::offset start_offset, model::offset hw, model::offset lso)
+      : start_offset(start_offset)
+      , high_watermark(hw)
       , last_stable_offset(lso)
       , error(error_code::none) {}
 
     std::optional<model::record_batch_reader> reader;
+    model::offset start_offset;
     model::offset high_watermark;
     model::offset last_stable_offset;
     error_code error;

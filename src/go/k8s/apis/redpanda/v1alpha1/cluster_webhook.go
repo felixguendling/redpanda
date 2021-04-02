@@ -10,8 +10,6 @@
 package v1alpha1
 
 import (
-	"reflect"
-
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -22,9 +20,9 @@ import (
 )
 
 const (
-	kb	= 1024
-	mb	= 1024 * kb
-	gb	= 1024 * mb
+	kb = 1024
+	mb = 1024 * kb
+	gb = 1024 * mb
 )
 
 // log is for logging in this package.
@@ -58,13 +56,13 @@ func (r *Cluster) ValidateCreate() error {
 
 	var allErrs field.ErrorList
 
-	if err := r.checkCollidingPorts(); err != nil {
-		allErrs = append(allErrs, err...)
-	}
+	allErrs = append(allErrs, r.checkCollidingPorts()...)
 
-	if err := r.validateMemory(); err != nil {
-		allErrs = append(allErrs, err...)
-	}
+	allErrs = append(allErrs, r.validateMemory()...)
+
+	allErrs = append(allErrs, r.validateTLS()...)
+
+	allErrs = append(allErrs, r.validateArchivalStorage()...)
 
 	if len(allErrs) == 0 {
 		return nil
@@ -87,18 +85,14 @@ func (r *Cluster) ValidateUpdate(old runtime.Object) error {
 				r.Spec.Replicas,
 				"scaling down is not supported"))
 	}
-	if !reflect.DeepEqual(r.Spec.Configuration, oldCluster.Spec.Configuration) {
-		allErrs = append(allErrs,
-			field.Invalid(field.NewPath("spec").Child("configuration"),
-				r.Spec.Configuration,
-				"updating configuration is not supported"))
-	}
 
-	if err := r.checkCollidingPorts(); err != nil {
-		allErrs = append(allErrs, err...)
-	}
+	allErrs = append(allErrs, r.checkCollidingPorts()...)
 
 	allErrs = append(allErrs, r.validateMemory()...)
+
+	allErrs = append(allErrs, r.validateTLS()...)
+
+	allErrs = append(allErrs, r.validateArchivalStorage()...)
 
 	if len(allErrs) == 0 {
 		return nil
@@ -119,7 +113,73 @@ func (r *Cluster) validateMemory() field.ErrorList {
 	var allErrs field.ErrorList
 	quantity := resource.MustParse(ReserveMemoryString)
 	if !r.Spec.Configuration.DeveloperMode && (r.Spec.Resources.Limits.Memory().Value()-quantity.Value()) < gb {
-		allErrs = append(allErrs, field.Invalid(field.NewPath("spec").Child("resources").Child("limits").Child("memory"), r.Spec.Resources.Limits.Memory(), "need minimum of 1GB + 1MB of memory per node"))
+		allErrs = append(allErrs,
+			field.Invalid(
+				field.NewPath("spec").Child("resources").Child("limits").Child("memory"),
+				r.Spec.Resources.Limits.Memory(),
+				"need minimum of 1GB + 1MB of memory per node"))
+	}
+	return allErrs
+}
+
+func (r *Cluster) validateTLS() field.ErrorList {
+	var allErrs field.ErrorList
+	if r.Spec.Configuration.TLS.KafkaAPI.RequireClientAuth && !r.Spec.Configuration.TLS.KafkaAPI.Enabled {
+		allErrs = append(allErrs,
+			field.Invalid(
+				field.NewPath("spec").Child("configuration").Child("tls").Child("requireclientauth"),
+				r.Spec.Configuration.TLS.KafkaAPI.RequireClientAuth,
+				"Enabled has to be set to true for RequireClientAuth to be allowed to be true"))
+	}
+	if r.Spec.Configuration.TLS.KafkaAPI.IssuerRef != nil && r.Spec.Configuration.TLS.KafkaAPI.NodeSecretRef != nil {
+		allErrs = append(allErrs,
+			field.Invalid(
+				field.NewPath("spec").Child("configuration").Child("tls").Child("nodeSecretRef"),
+				r.Spec.Configuration.TLS.KafkaAPI.NodeSecretRef,
+				"Cannot provide both IssuerRef and NodeSecretRef"))
+	}
+	return allErrs
+}
+
+func (r *Cluster) validateArchivalStorage() field.ErrorList {
+	var allErrs field.ErrorList
+	if !r.Spec.CloudStorage.Enabled {
+		return allErrs
+	}
+	if r.Spec.CloudStorage.AccessKey == "" {
+		allErrs = append(allErrs,
+			field.Invalid(
+				field.NewPath("spec").Child("configuration").Child("cloudStorage").Child("accessKey"),
+				r.Spec.CloudStorage.AccessKey,
+				"AccessKey has to be provided for cloud storage to be enabled"))
+	}
+	if r.Spec.CloudStorage.Bucket == "" {
+		allErrs = append(allErrs,
+			field.Invalid(
+				field.NewPath("spec").Child("configuration").Child("cloudStorage").Child("bucket"),
+				r.Spec.CloudStorage.Bucket,
+				"Bucket has to be provided for cloud storage to be enabled"))
+	}
+	if r.Spec.CloudStorage.Region == "" {
+		allErrs = append(allErrs,
+			field.Invalid(
+				field.NewPath("spec").Child("configuration").Child("cloudStorage").Child("region"),
+				r.Spec.CloudStorage.Region,
+				"Region has to be provided for cloud storage to be enabled"))
+	}
+	if r.Spec.CloudStorage.SecretKeyRef.Name == "" {
+		allErrs = append(allErrs,
+			field.Invalid(
+				field.NewPath("spec").Child("configuration").Child("cloudStorage").Child("secretKeyRef").Child("name"),
+				r.Spec.CloudStorage.SecretKeyRef.Name,
+				"SecretKeyRef name has to be provided for cloud storage to be enabled"))
+	}
+	if r.Spec.CloudStorage.SecretKeyRef.Namespace == "" {
+		allErrs = append(allErrs,
+			field.Invalid(
+				field.NewPath("spec").Child("configuration").Child("cloudStorage").Child("secretKeyRef").Child("namespace"),
+				r.Spec.CloudStorage.SecretKeyRef.Namespace,
+				"SecretKeyRef namespace has to be provided for cloud storage to be enabled"))
 	}
 	return allErrs
 }
@@ -154,6 +214,20 @@ func (r *Cluster) checkCollidingPorts() field.ErrorList {
 			field.Invalid(field.NewPath("spec").Child("configuration", "admin", "port"),
 				r.Spec.Configuration.AdminAPI.Port,
 				"admin port collide with Spec.Configuration.RPCServer.Port"))
+	}
+
+	if r.Spec.ExternalConnectivity.Enabled && r.Spec.Configuration.KafkaAPI.Port+1 == r.Spec.Configuration.RPCServer.Port {
+		allErrs = append(allErrs,
+			field.Invalid(field.NewPath("spec").Child("configuration", "rpcServer", "port"),
+				r.Spec.Configuration.RPCServer.Port,
+				"rpc port collide with external Kafka API that is not visible in the Cluster CR"))
+	}
+
+	if r.Spec.ExternalConnectivity.Enabled && r.Spec.Configuration.KafkaAPI.Port+1 == r.Spec.Configuration.AdminAPI.Port {
+		allErrs = append(allErrs,
+			field.Invalid(field.NewPath("spec").Child("configuration", "admin", "port"),
+				r.Spec.Configuration.AdminAPI.Port,
+				"admin port collide with external Kafka API that is not visible in the Cluster CR"))
 	}
 
 	return allErrs

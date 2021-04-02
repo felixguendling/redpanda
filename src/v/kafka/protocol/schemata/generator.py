@@ -265,6 +265,15 @@ STRUCT_TYPES = [
     "DeletableGroupResult",
     "DescribeAclsResource",
     "AclDescription",
+    "DescribeLogDirsTopic",
+    "DescribableLogDirTopic",
+    "DescribeLogDirsResult",
+    "DescribeLogDirsPartition",
+    "CreatableAcl",
+    "CreatableAclResult",
+    "DeleteAclsFilter",
+    "DeleteAclsFilterResult",
+    "DeleteAclsMatchingAcl",
 ]
 
 SCALAR_TYPES = list(basic_type_map.keys())

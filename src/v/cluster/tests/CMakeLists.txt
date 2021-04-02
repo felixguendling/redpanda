@@ -28,7 +28,9 @@ set(srcs
     topic_updates_dispatcher_test.cc
     controller_backend_test.cc
     configuration_change_test.cc
-    seq_stm_tests.cc
+    idempotency_tests.cc
+    tm_stm_tests.cc
+    rm_stm_tests.cc
     id_allocator_stm_test.cc)
 
 rp_test(
@@ -51,5 +53,4 @@ rp_test(
   SOURCES partition_moving_test.cc
   LIBRARIES v::seastar_testing_main v::application v::storage_test_utils
   DEFINITIONS SEASTAR_TESTING_MAIN
-  ARGS "-- -c 1"
 )

@@ -19,6 +19,7 @@
 #include "kafka/types.h"
 #include "model/fundamental.h"
 #include "pandaproxy/configuration.h"
+#include "pandaproxy/json/exceptions.h"
 #include "pandaproxy/json/requests/create_consumer.h"
 #include "pandaproxy/json/requests/fetch.h"
 #include "pandaproxy/json/requests/offset_commit.h"
@@ -28,6 +29,7 @@
 #include "pandaproxy/json/requests/produce.h"
 #include "pandaproxy/json/requests/subscribe_consumer.h"
 #include "pandaproxy/json/rjson_util.h"
+#include "pandaproxy/parsing/httpd.h"
 #include "pandaproxy/reply.h"
 #include "raft/types.h"
 #include "ssx/future-util.h"
@@ -78,12 +80,18 @@ ppj::serialization_format parse_serialization_format(std::string_view accept) {
 
 ss::future<server::reply_t>
 get_topics_names(server::request_t rq, server::reply_t rp) {
+    parse::content_type_header(
+      *rq.req,
+      {json::serialization_format::json_v2, json::serialization_format::none});
+    auto res_fmt = parse::accept_header(
+      *rq.req,
+      {json::serialization_format::json_v2, json::serialization_format::none});
     rq.req.reset();
     auto make_list_topics_req = []() {
         return kafka::metadata_request{.list_all_topics = true};
     };
     return rq.ctx.client.dispatch(make_list_topics_req)
-      .then([rp = std::move(rp)](
+      .then([res_fmt, rp = std::move(rp)](
               kafka::metadata_request::api_type::response_type res) mutable {
           std::vector<model::topic_view> names;
           names.reserve(res.topics.size());
@@ -98,56 +106,52 @@ get_topics_names(server::request_t rq, server::reply_t rp) {
 
           auto json_rslt = ppj::rjson_serialize(names);
           rp.rep->write_body("json", json_rslt);
+          rp.mime_type = res_fmt;
           return std::move(rp);
       });
 }
 
 ss::future<server::reply_t>
 get_topics_records(server::request_t rq, server::reply_t rp) {
-    auto fmt = parse_serialization_format(rq.req->get_header("Accept"));
-    if (fmt == ppj::serialization_format::unsupported) {
-        rp.rep = unprocessable_entity("Unsupported serialization format");
-        return ss::make_ready_future<server::reply_t>(std::move(rp));
-    }
+    parse::content_type_header(*rq.req, {json::serialization_format::json_v2});
+    auto res_fmt = parse::accept_header(
+      *rq.req, {json::serialization_format::binary_v2});
 
-    model::topic_partition tp{
-      model::topic(rq.req->param["topic_name"]),
-      model::partition_id{boost::lexical_cast<model::partition_id::type>(
-        rq.req->param["partition_id"])}};
-    model::offset offset{boost::lexical_cast<model::offset::type>(
-      rq.req->get_query_param("offset"))};
-    std::chrono::milliseconds timeout{
-      boost::lexical_cast<std::chrono::milliseconds::rep>(
-        rq.req->get_query_param("timeout"))};
-    int32_t max_bytes{
-      boost::lexical_cast<int32_t>(rq.req->get_query_param("max_bytes"))};
+    auto tp{model::topic_partition{
+      parse::request_param<model::topic>(*rq.req, "topic_name"),
+      parse::request_param<model::partition_id>(*rq.req, "partition_id")}};
+    auto offset{parse::query_param<model::offset>(*rq.req, "offset")};
+    auto timeout{
+      parse::query_param<std::chrono::milliseconds>(*rq.req, "timeout")};
+    int32_t max_bytes{parse::query_param<int32_t>(*rq.req, "max_bytes")};
 
     rq.req.reset();
     return rq.ctx.client
       .fetch_partition(std::move(tp), offset, max_bytes, timeout)
-      .then([fmt, rp = std::move(rp)](kafka::fetch_response res) mutable {
+      .then([res_fmt, rp = std::move(rp)](kafka::fetch_response res) mutable {
           rapidjson::StringBuffer str_buf;
           rapidjson::Writer<rapidjson::StringBuffer> w(str_buf);
 
-          ppj::rjson_serialize_fmt(fmt)(w, std::move(res));
+          ppj::rjson_serialize_fmt(res_fmt)(w, std::move(res));
 
           // TODO Ben: Prevent this linearization
           ss::sstring json_rslt = str_buf.GetString();
           rp.rep->write_body("json", json_rslt);
+          rp.mime_type = res_fmt;
           return std::move(rp);
       });
 }
 
 ss::future<server::reply_t>
 post_topics_name(server::request_t rq, server::reply_t rp) {
-    auto fmt = parse_serialization_format(rq.req->get_header("Accept"));
-    if (fmt == ppj::serialization_format::unsupported) {
-        rp.rep = unprocessable_entity("Unsupported serialization format");
-        return ss::make_ready_future<server::reply_t>(std::move(rp));
-    }
+    auto req_fmt = parse::content_type_header(
+      *rq.req, {json::serialization_format::binary_v2});
+    auto res_fmt = parse::accept_header(
+      *rq.req,
+      {json::serialization_format::json_v2, json::serialization_format::none});
 
     auto raw_records = ppj::rjson_parse(
-      rq.req->content.data(), ppj::produce_request_handler(fmt));
+      rq.req->content.data(), ppj::produce_request_handler(req_fmt));
 
     absl::flat_hash_map<model::partition_id, storage::record_batch_builder>
       partition_builders;
@@ -173,7 +177,7 @@ post_topics_name(server::request_t rq, server::reply_t rp) {
             .batch = std::move(pb.second).build()}});
     }
 
-    auto topic = model::topic(rq.req->param["topic_name"]);
+    auto topic = parse::request_param<model::topic>(*rq.req, "topic_name");
     return ssx::parallel_transform(
              std::move(partitions),
              [topic,
@@ -182,7 +186,7 @@ post_topics_name(server::request_t rq, server::reply_t rp) {
                    model::topic_partition(topic, p.id),
                    std::move(*p.adapter.batch));
              })
-      .then([topic, rp{std::move(rp)}](auto responses) mutable {
+      .then([topic, res_fmt, rp{std::move(rp)}](auto responses) mutable {
           std::vector<kafka::produce_response::topic> topics;
           topics.push_back(kafka::produce_response::topic{
             .name{std::move(topic)}, .partitions{std::move(responses)}});
@@ -193,6 +197,7 @@ post_topics_name(server::request_t rq, server::reply_t rp) {
 
           auto json_rslt = ppj::rjson_serialize(res.topics[0]);
           rp.rep->write_body("json", json_rslt);
+          rp.mime_type = res_fmt;
           return std::move(rp);
       });
 }
@@ -204,14 +209,16 @@ create_consumer(server::request_t rq, server::reply_t rp) {
     auto group_id = kafka::group_id(rq.req->param["group_name"]);
 
     return rq.ctx.client.create_consumer(group_id).then(
-      [group_id, rp{std::move(rp)}](kafka::member_id m_id) mutable {
-          auto adv_addr = shard_local_cfg().advertised_pandaproxy_api();
+      [group_id, rq{std::move(rq)}, rp{std::move(rp)}](
+        kafka::member_id m_id) mutable {
+          auto adv_addr = rq.ctx.config.advertised_pandaproxy_api();
           json::create_consumer_response res{
             .instance_id = m_id,
             .base_uri = fmt::format(
-              "http://{}:{}/consumers/{}",
+              "http://{}:{}/consumers/{}/instances/{}",
               adv_addr.host(),
               adv_addr.port(),
+              group_id(),
               m_id())};
           auto json_rslt = ppj::rjson_serialize(res);
           rp.rep->write_body("json", json_rslt);

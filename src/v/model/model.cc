@@ -96,31 +96,6 @@ std::ostream& operator<<(std::ostream& os, const materialized_ntp& m) {
     return os;
 }
 
-std::ostream& operator<<(std::ostream& os, const compression& c) {
-    os << "{compression: ";
-    switch (c) {
-    case compression::none:
-        os << "none";
-        break;
-    case compression::gzip:
-        os << "gzip";
-        break;
-    case compression::snappy:
-        os << "snappy";
-        break;
-    case compression::lz4:
-        os << "lz4";
-        break;
-    case compression::zstd:
-        os << "zstd";
-        break;
-    default:
-        os << "ERROR";
-        break;
-    }
-    return os << "}";
-}
-
 std::ostream& operator<<(std::ostream& os, timestamp ts) {
     if (ts != timestamp::missing()) {
         return ss::fmt_print(os, "{{timestamp: {}}}", ts.value());
@@ -148,11 +123,15 @@ operator<<(std::ostream& o, const model::topic_namespace_view& tp_ns) {
 }
 
 std::ostream& operator<<(std::ostream& os, timestamp_type ts) {
+    /**
+     * We need to use specific string representations of timestamp_type as this
+     * is related with protocol correctness
+     */
     switch (ts) {
     case timestamp_type::append_time:
-        return os << "{append_time}";
+        return os << "LogAppendTime";
     case timestamp_type::create_time:
-        return os << "{create_time}";
+        return os << "CreateTime";
     }
     return os << "{unknown timestamp:" << static_cast<int>(ts) << "}";
 }
@@ -179,6 +158,11 @@ std::ostream& operator<<(std::ostream& o, const record& r) {
         o << h;
     }
     return o << "]}";
+}
+
+std::ostream& operator<<(std::ostream& o, const producer_identity& pid) {
+    fmt::print(o, "{{producer_identity: id={}, epoch={}}}", pid.id, pid.epoch);
+    return o;
 }
 
 std::ostream&
@@ -249,7 +233,8 @@ std::istream& operator>>(std::istream& i, compression& c) {
           .match("gzip", compression::gzip)
           .match("snappy", compression::snappy)
           .match("lz4", compression::lz4)
-          .match("zstd", compression::zstd);
+          .match("zstd", compression::zstd)
+          .match("producer", compression::producer);
     return i;
 }
 
@@ -329,22 +314,28 @@ std::istream& operator>>(std::istream& i, timestamp_type& ts_type) {
 };
 
 std::ostream& operator<<(std::ostream& o, cleanup_policy_bitflags c) {
-    o << "{";
-    auto has_prev = false;
-    if (std::underlying_type_t<cleanup_policy_bitflags>(
-          c & cleanup_policy_bitflags::deletion)) {
-        o << "cleanup_policy_bitflags::deletion";
+    if (c == model::cleanup_policy_bitflags::none) {
+        o << "none";
+        return o;
     }
 
-    if (std::underlying_type_t<cleanup_policy_bitflags>(
-          c & cleanup_policy_bitflags::compaction)) {
-        if (has_prev) {
-            o << " | ";
-        }
-        o << "cleanup_policy_bitflags::compaction";
+    auto compaction = (c & model::cleanup_policy_bitflags::compaction)
+                      == model::cleanup_policy_bitflags::compaction;
+    auto deletion = (c & model::cleanup_policy_bitflags::deletion)
+                    == model::cleanup_policy_bitflags::deletion;
+
+    if (compaction && deletion) {
+        o << "compact,delete";
+        return o;
     }
 
-    return o << "}";
+    if (compaction) {
+        o << "compact";
+    } else if (deletion) {
+        o << "delete";
+    }
+
+    return o;
 }
 
 std::istream& operator>>(std::istream& i, cleanup_policy_bitflags& cp) {

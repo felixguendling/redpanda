@@ -17,6 +17,7 @@
 #include "s3/logger.h"
 #include "s3/signature.h"
 
+#include <seastar/core/abort_source.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/iostream.hh>
@@ -41,6 +42,7 @@ struct aws_header_names {
     static constexpr boost::beast::string_view max_keys = "max-keys";
     static constexpr boost::beast::string_view x_amz_content_sha256
       = "x-amz-content-sha256";
+    static constexpr boost::beast::string_view x_amz_tagging = "x-amz-tagging";
 };
 
 struct aws_header_values {
@@ -51,32 +53,61 @@ struct aws_header_values {
 
 // configuration //
 
+static ss::sstring make_endpoint_url(
+  const aws_region_name& region,
+  const std::optional<endpoint_url>& url_override) {
+    if (url_override) {
+        return url_override.value();
+    }
+    return fmt::format("s3.{}.amazonaws.com", region());
+}
+
 ss::future<configuration> configuration::make_configuration(
   const public_key_str& pkey,
   const private_key_str& skey,
-  const aws_region_name& region) {
+  const aws_region_name& region,
+  const default_overrides overrides) {
     configuration client_cfg;
-    ss::tls::credentials_builder cred_builder;
-    const auto endpoint_uri = fmt::format("s3.{}.amazonaws.com", region());
+    const auto endpoint_uri = make_endpoint_url(region, overrides.endpoint);
+    client_cfg.tls_sni_hostname = endpoint_uri;
     // Setup credentials for TLS
-    ss::tls::credentials_builder builder;
     client_cfg.access_key = pkey;
     client_cfg.secret_key = skey;
     client_cfg.region = region;
     client_cfg.uri = access_point_uri(endpoint_uri);
-    // NOTE: this is a pre-defined gnutls priority string that
-    // picks the the ciphersuites with 128-bit ciphers which
-    // leads to up to 10x improvement in upload speed, compared
-    // to 256-bit ciphers
-    cred_builder.set_priority_string("PERFORMANCE");
-    co_await cred_builder.set_system_trust();
-    client_cfg.credentials
-      = co_await cred_builder.build_reloadable_certificate_credentials();
+    ss::tls::credentials_builder cred_builder;
+    if (overrides.disable_tls == false) {
+        // NOTE: this is a pre-defined gnutls priority string that
+        // picks the the ciphersuites with 128-bit ciphers which
+        // leads to up to 10x improvement in upload speed, compared
+        // to 256-bit ciphers
+        cred_builder.set_priority_string("PERFORMANCE");
+        if (overrides.trust_file.has_value()) {
+            auto file = overrides.trust_file.value();
+            vlog(s3_log.info, "Use non-default trust file {}", file());
+            co_await cred_builder.set_x509_trust_file(
+              file().string(), ss::tls::x509_crt_format::PEM);
+        } else {
+            // Use GnuTLS defaults, might not work on all systems
+            co_await cred_builder.set_system_trust();
+        }
+        client_cfg.credentials
+          = co_await cred_builder.build_reloadable_certificate_credentials();
+    }
     auto addr = co_await ss::net::dns::resolve_name(
       client_cfg.uri(), ss::net::inet_address::family::INET);
-    constexpr uint16_t port = 443;
-    client_cfg.server_addr = ss::socket_address(addr, port);
+    constexpr uint16_t default_port = 443;
+    client_cfg.server_addr = ss::socket_address(
+      addr, overrides.port ? *overrides.port : default_port);
     co_return client_cfg;
+}
+
+std::ostream& operator<<(std::ostream& o, const configuration& c) {
+    o << "{access_key:" << c.access_key << ",region:" << c.region()
+      << ",secret_key:****"
+      << ",access_point_uri:" << c.uri() << ",server_addr:" << c.server_addr
+      << "}";
+    return o;
 }
 
 // request_creator //
@@ -94,7 +125,7 @@ result<http::client::request_header> request_creator::make_get_object_request(
     // Authorization:{signature}
     // x-amz-content-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
     auto host = fmt::format("{}.{}", name(), _ap());
-    auto target = fmt::format("/{}", key());
+    auto target = fmt::format("/{}", key().string());
     std::string emptysig
       = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
     header.method(boost::beast::http::verb::get);
@@ -113,7 +144,10 @@ result<http::client::request_header> request_creator::make_get_object_request(
 
 result<http::client::request_header>
 request_creator::make_unsigned_put_object_request(
-  bucket_name const& name, object_key const& key, size_t payload_size_bytes) {
+  bucket_name const& name,
+  object_key const& key,
+  size_t payload_size_bytes,
+  const std::vector<object_tag>& tags) {
     // PUT /my-image.jpg HTTP/1.1
     // Host: myBucket.s3.<Region>.amazonaws.com
     // Date: Wed, 12 Oct 2009 17:50:00 GMT
@@ -125,7 +159,7 @@ request_creator::make_unsigned_put_object_request(
     // [11434 bytes of object data]
     http::client::request_header header{};
     auto host = fmt::format("{}.{}", name(), _ap());
-    auto target = fmt::format("/{}", key());
+    auto target = fmt::format("/{}", key().string());
     std::string sig = "UNSIGNED-PAYLOAD";
     header.method(boost::beast::http::verb::put);
     header.target(target);
@@ -138,6 +172,13 @@ request_creator::make_unsigned_put_object_request(
       boost::beast::http::field::content_length,
       std::to_string(payload_size_bytes));
     header.insert(aws_header_names::x_amz_content_sha256, sig);
+    if (!tags.empty()) {
+        std::stringstream tstr;
+        for (const auto& [key, val] : tags) {
+            tstr << fmt::format("&{}={}", key, val);
+        }
+        header.insert(aws_header_names::x_amz_tagging, tstr.str().substr(1));
+    }
     auto ec = _sign.sign_header(header, sig);
     if (ec) {
         return ec;
@@ -168,15 +209,10 @@ request_creator::make_list_objects_v2_request(
     header.insert(boost::beast::http::field::content_length, "0");
     header.insert(aws_header_names::x_amz_content_sha256, emptysig);
     if (prefix) {
-        header.insert(
-          aws_header_names::prefix,
-          boost::beast::string_view{(*prefix)().data(), (*prefix)().size()});
+        header.insert(aws_header_names::prefix, (*prefix)().string());
     }
     if (start_after) {
-        header.insert(
-          aws_header_names::start_after,
-          boost::beast::string_view{
-            (*start_after)().data(), (*start_after)().size()});
+        header.insert(aws_header_names::start_after, (*start_after)().string());
     }
     if (max_keys) {
         header.insert(aws_header_names::start_after, std::to_string(*max_keys));
@@ -201,7 +237,7 @@ request_creator::make_delete_object_request(
     //
     // NOTE: x-amz-mfa, x-amz-bypass-governance-retention are not used for now
     auto host = fmt::format("{}.{}", name(), _ap());
-    auto target = fmt::format("/{}", key());
+    auto target = fmt::format("/{}", key().string());
     std::string emptysig
       = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
     header.method(boost::beast::http::verb::delete_);
@@ -320,6 +356,10 @@ client::client(const configuration& conf)
   : _requestor(conf)
   , _client(conf) {}
 
+client::client(const configuration& conf, const ss::abort_source& as)
+  : _requestor(conf)
+  , _client(conf, as) {}
+
 ss::future<> client::shutdown() { return _client.shutdown(); }
 ss::future<http::client::response_stream_ref>
 client::get_object(bucket_name const& name, object_key const& key) {
@@ -356,9 +396,10 @@ ss::future<> client::put_object(
   bucket_name const& name,
   object_key const& id,
   size_t payload_size,
-  ss::input_stream<char>&& body) {
+  ss::input_stream<char>&& body,
+  const std::vector<object_tag>& tags) {
     auto header = _requestor.make_unsigned_put_object_request(
-      name, id, payload_size);
+      name, id, payload_size, tags);
     if (!header) {
         return ss::make_exception_future<>(std::system_error(header.error()));
     }
@@ -375,7 +416,10 @@ ss::future<> client::put_object(
                     }
                     return ss::now();
                 });
-            });
+            })
+            .handle_exception_type(
+              [](const ss::abort_requested_exception&) { return ss::now(); })
+            .finally([&body]() { return body.close(); });
       });
 }
 

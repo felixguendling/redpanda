@@ -47,8 +47,12 @@ v_cc_library(
     controller.cc
     partition.cc
     partition_probe.cc
-    seq_stm.cc
     id_allocator_stm.cc
+    persisted_stm.cc
+    tm_stm.cc
+    rm_stm.cc
+    security_manager.cc
+    security_frontend.cc
   DEPS
     Seastar::seastar
     controller_rpc

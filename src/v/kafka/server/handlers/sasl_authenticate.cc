@@ -11,13 +11,13 @@
 
 #include "bytes/bytes.h"
 #include "kafka/protocol/errors.h"
-#include "kafka/security/scram_algorithm.h"
+#include "security/scram_algorithm.h"
 
 namespace kafka {
 
 template<>
 ss::future<response_ptr> sasl_authenticate_handler::handle(
-  request_context&& ctx, [[maybe_unused]] ss::smp_service_group g) {
+  request_context ctx, [[maybe_unused]] ss::smp_service_group g) {
     sasl_authenticate_request request;
     request.decode(ctx.reader(), ctx.header().version);
     vlog(klog.debug, "Received SASL_AUTHENTICATE {}", request);

@@ -68,9 +68,9 @@ class Repository {
    * remove a handle from the handle map
    * @param handle
    */
-  remove = (handle: Handle): void => {
+  remove(handle: Handle): void {
     this.handles.delete(handle.coprocessor.globalId);
-  };
+  }
 
   /**
    * returns a handle list by given ids
@@ -117,11 +117,8 @@ class Repository {
         `Wasm function (${handle.coprocessor.globalId}) ` +
           `didn't return a Promise<Map<string, RecordBatch>>`
       );
-      return handleError(
-        handle.coprocessor,
-        requestItem,
-        error,
-        PolicyError.Deregister
+      return Promise.reject(
+        handleError(handle, requestItem, error, PolicyError.Deregister)
       );
     }
   }
@@ -208,9 +205,12 @@ class Repository {
                   recordBatch,
                   resultMap
                 )
-              );
+              )
+              .catch((responseError: ProcessBatchReplyItem) => {
+                return responseError;
+              });
           } catch (e) {
-            return handleError(handle.coprocessor, requestItem, e);
+            return handleError(handle, requestItem, e);
           }
         });
         return prev.concat(apply);

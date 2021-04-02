@@ -10,7 +10,9 @@
 package system
 
 import (
+	"errors"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"syscall"
@@ -24,9 +26,9 @@ import (
 )
 
 type Metrics struct {
-	CpuPercentage	float64
-	FreeMemoryMB	float64
-	FreeSpaceMB	float64
+	CpuPercentage float64
+	FreeMemoryMB  float64
+	FreeSpaceMB   float64
 }
 
 type stat struct {
@@ -36,13 +38,15 @@ type stat struct {
 	// in user mode, measured in clock ticks (divide by
 	// sysconf(_SC_CLK_TCK)).  This includes guest_time (time
 	// spent running a virtual CPU).
-	utime	uint64
+	utime uint64
 
 	// Amount of time that this process has been scheduled
 	// in kernel mode, measured in clock ticks (divide by
 	// sysconf(_SC_CLK_TCK)).
-	stime	uint64
+	stime uint64
 }
+
+var errRedpandaDown = errors.New("the local redpanda process isn't running.")
 
 func GatherMetrics(
 	fs afero.Fs, timeout time.Duration, conf config.Config,
@@ -57,6 +61,9 @@ func GatherMetrics(
 
 	pidStr, err := utils.ReadEnsureSingleLine(fs, conf.PIDFile())
 	if err != nil {
+		if os.IsNotExist(err) {
+			return metrics, errRedpandaDown
+		}
 		errs = multierror.Append(errs, err)
 		return metrics, errs
 	}
@@ -133,8 +140,8 @@ func readStat(fs afero.Fs, pid int) (*stat, error) {
 	}
 
 	return &stat{
-		utime:	utime,
-		stime:	stime,
+		utime: utime,
+		stime: stime,
 	}, nil
 }
 
@@ -147,4 +154,8 @@ func getFreeDiskSpaceMB(conf config.Config) (float64, error) {
 	// Available blocks * block size (in bytes)
 	freeSpaceBytes := stat.Bavail * uint64(stat.Bsize)
 	return float64(freeSpaceBytes) / 1024.0 / 1024.0, nil
+}
+
+func IsErrRedpandaDown(err error) bool {
+	return err == errRedpandaDown
 }

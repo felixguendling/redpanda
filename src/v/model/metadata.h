@@ -19,6 +19,7 @@
 #include <seastar/core/sstring.hh>
 
 #include <absl/hash/hash.h>
+#include <bits/stdint-intn.h>
 #include <boost/functional/hash.hpp>
 
 #include <optional>
@@ -70,6 +71,8 @@ struct broker_endpoint final {
 };
 
 std::ostream& operator<<(std::ostream&, const broker_endpoint&);
+
+enum class violation_recovery_policy { crash = 0, best_effort };
 
 class broker {
 public:
@@ -145,6 +148,11 @@ struct partition_metadata {
     std::optional<model::node_id> leader_node;
 
     friend std::ostream& operator<<(std::ostream&, const partition_metadata&);
+};
+
+enum class isolation_level : int8_t {
+    read_uncommitted = 0,
+    read_committed = 1,
 };
 
 struct topic_namespace_view {
@@ -242,6 +250,12 @@ struct topic_metadata {
 
     friend std::ostream& operator<<(std::ostream&, const topic_metadata&);
 };
+
+inline std::ostream&
+operator<<(std::ostream& o, const model::violation_recovery_policy& x) {
+    fmt::print(o, "violation_recovery_policy: {}", (int32_t)x);
+    return o;
+}
 
 namespace internal {
 /*

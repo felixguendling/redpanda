@@ -26,12 +26,29 @@ namespace kafka {
 
 template<>
 ss::future<response_ptr> init_producer_id_handler::handle(
-  request_context&& ctx, [[maybe_unused]] ss::smp_service_group g) {
+  request_context ctx, [[maybe_unused]] ss::smp_service_group g) {
     return ss::do_with(std::move(ctx), [](request_context& ctx) {
         vlog(klog.trace, "processing init_producer_id");
 
         init_producer_id_request request;
         request.decode(ctx.reader(), ctx.header().version);
+
+        if (request.data.transactional_id) {
+            if (!ctx.authorized(
+                  security::acl_operation::write,
+                  transactional_id(*request.data.transactional_id))) {
+                init_producer_id_response reply;
+                reply.data.error_code
+                  = error_code::transactional_id_authorization_failed;
+                return ctx.respond(reply);
+            }
+        } else if (!ctx.authorized(
+                     security::acl_operation::idempotent_write,
+                     security::default_cluster_name)) {
+            init_producer_id_response reply;
+            reply.data.error_code = error_code::cluster_authorization_failed;
+            return ctx.respond(reply);
+        }
 
         return ctx.id_allocator_frontend()
           .allocate_id(config::shard_local_cfg().create_topic_timeout_ms())

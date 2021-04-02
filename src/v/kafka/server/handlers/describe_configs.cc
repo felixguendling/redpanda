@@ -11,14 +11,18 @@
 
 #include "cluster/metadata_cache.h"
 #include "config/configuration.h"
+#include "config/data_directory_path.h"
 #include "kafka/protocol/errors.h"
 #include "kafka/server/handlers/topics/topic_utils.h"
+#include "kafka/server/handlers/topics/types.h"
 #include "kafka/server/request_context.h"
 #include "kafka/server/response.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/namespace.h"
 #include "model/validation.h"
+#include "security/acl.h"
+#include "ssx/sformat.h"
 
 #include <seastar/core/do_with.hh>
 #include <seastar/core/smp.hh>
@@ -35,14 +39,129 @@ namespace kafka {
 template<typename T>
 static void add_config(
   describe_configs_result& result,
-  const char* name,
+  std::string_view name,
   T value,
   describe_configs_source source) {
     result.configs.push_back(describe_configs_resource_result{
-      .name = name,
-      .value = fmt::format("{}", value),
+      .name = ss::sstring(name),
+      .value = ssx::sformat("{}", value),
       .config_source = source,
     });
+}
+
+template<typename T>
+static ss::sstring describe_as_string(const T& t) {
+    return ssx::sformat("{}", t);
+}
+
+template<typename T, typename Func>
+static void add_broker_config(
+  describe_configs_result& result,
+  std::string_view name,
+  const config::property<T>& property,
+  bool include_synonyms,
+  Func&& describe_f) {
+    describe_configs_source src
+      = property.is_overriden() ? describe_configs_source::static_broker_config
+                                : describe_configs_source::default_config;
+
+    std::vector<describe_configs_synonym> synonyms;
+    if (include_synonyms) {
+        synonyms.reserve(2);
+        /**
+         * If value was overriden, include override
+         */
+        if (src == describe_configs_source::static_broker_config) {
+            synonyms.push_back(describe_configs_synonym{
+              .name = ss::sstring(property.name()),
+              .value = describe_f(property.value()),
+              .source = static_cast<int8_t>(
+                describe_configs_source::static_broker_config),
+            });
+        }
+        /**
+         * If property is required it has no default
+         */
+        if (!property.is_required()) {
+            synonyms.push_back(describe_configs_synonym{
+              .name = ss::sstring(property.name()),
+              .value = describe_f(property.default_value()),
+              .source = static_cast<int8_t>(
+                describe_configs_source::default_config),
+            });
+        }
+    }
+
+    result.configs.push_back(describe_configs_resource_result{
+      .name = ss::sstring(name),
+      .value = describe_f(property.value()),
+      .config_source = src,
+      .synonyms = std::move(synonyms),
+    });
+}
+
+template<typename T, typename Func>
+static void add_topic_config(
+  describe_configs_result& result,
+  std::string_view default_name,
+  const T& default_value,
+  std::string_view override_name,
+  const std::optional<T>& overrides,
+  bool include_synonyms,
+  Func&& describe_f) {
+    describe_configs_source src = overrides
+                                    ? describe_configs_source::topic
+                                    : describe_configs_source::default_config;
+
+    std::vector<describe_configs_synonym> synonyms;
+    if (include_synonyms) {
+        synonyms.reserve(2);
+        if (overrides) {
+            synonyms.push_back(describe_configs_synonym{
+              .name = ss::sstring(override_name),
+              .value = describe_f(*overrides),
+              .source = static_cast<int8_t>(describe_configs_source::topic),
+            });
+        }
+        synonyms.push_back(describe_configs_synonym{
+          .name = ss::sstring(default_name),
+          .value = describe_f(default_value),
+          .source = static_cast<int8_t>(
+            describe_configs_source::default_config),
+        });
+    }
+
+    result.configs.push_back(describe_configs_resource_result{
+      .name = ss::sstring(override_name),
+      .value = describe_f(overrides.value_or(default_value)),
+      .config_source = src,
+      .synonyms = std::move(synonyms),
+    });
+}
+
+template<typename T>
+static void add_topic_config(
+  describe_configs_result& result,
+  std::string_view default_name,
+  const std::optional<T>& default_value,
+  std::string_view override_name,
+  const tristate<T>& overrides,
+  bool include_synonyms) {
+    std::optional<ss::sstring> override_value;
+    if (overrides.is_disabled()) {
+        override_value = "-1";
+    } else if (overrides.has_value()) {
+        override_value = ssx::sformat("{}", overrides.value());
+    }
+
+    add_topic_config(
+      result,
+      default_name,
+      default_value ? ssx::sformat("{}", default_value.value()) : "-1",
+      override_name,
+      override_value,
+      include_synonyms,
+      [](const ss::sstring& s) { return s; });
 }
 
 static ss::sstring
@@ -54,7 +173,7 @@ kafka_endpoint_format(const std::vector<model::broker_endpoint>& endpoints) {
       endpoints.cend(),
       std::back_inserter(uris),
       [](const model::broker_endpoint& ep) {
-          return fmt::format(
+          return ssx::sformat(
             "{}://{}:{}",
             (ep.name.empty() ? "plain" : ep.name),
             ep.address.host(),
@@ -63,7 +182,8 @@ kafka_endpoint_format(const std::vector<model::broker_endpoint>& endpoints) {
     return boost::algorithm::join(uris, ",");
 }
 
-static void report_broker_config(describe_configs_result& result) {
+static void
+report_broker_config(describe_configs_result& result, bool include_synonyms) {
     if (!result.resource_name.empty()) {
         int32_t broker_id = -1;
         auto res = std::from_chars(
@@ -73,7 +193,7 @@ static void report_broker_config(describe_configs_result& result) {
         if (res.ec == std::errc()) {
             if (broker_id != config::shard_local_cfg().node_id()) {
                 result.error_code = error_code::invalid_request;
-                result.error_message = fmt::format(
+                result.error_message = ssx::sformat(
                   "Unexpected broker id {} expected {}",
                   broker_id,
                   config::shard_local_cfg().node_id());
@@ -81,53 +201,112 @@ static void report_broker_config(describe_configs_result& result) {
             }
         } else {
             result.error_code = error_code::invalid_request;
-            result.error_message = fmt::format(
+            result.error_message = ssx::sformat(
               "Broker id must be an integer but received {}",
               result.resource_name);
             return;
         }
     }
 
-    add_config(
+    add_broker_config(
       result,
       "listeners",
-      kafka_endpoint_format(config::shard_local_cfg().kafka_api()),
-      describe_configs_source::static_broker_config);
+      config::shard_local_cfg().kafka_api,
+      include_synonyms,
+      &kafka_endpoint_format);
 
-    add_config(
+    add_broker_config(
       result,
       "advertised.listeners",
-      kafka_endpoint_format(config::shard_local_cfg().advertised_kafka_api()),
-      describe_configs_source::static_broker_config);
+      config::shard_local_cfg().advertised_kafka_api_property(),
+      include_synonyms,
+      &kafka_endpoint_format);
 
-    add_config(
+    add_broker_config(
       result,
       "log.segment.bytes",
-      config::shard_local_cfg().log_segment_size(),
-      describe_configs_source::static_broker_config);
+      config::shard_local_cfg().log_segment_size,
+      include_synonyms,
+      &describe_as_string<size_t>);
 
-    add_config(
+    add_broker_config(
       result,
       "log.retention.bytes",
-      config::shard_local_cfg().retention_bytes(),
-      describe_configs_source::static_broker_config);
+      config::shard_local_cfg().retention_bytes,
+      include_synonyms,
+      [](std::optional<size_t> sz) {
+          return ssx::sformat("{}", sz ? sz.value() : -1);
+      });
 
-    add_config(
+    add_broker_config(
       result,
       "log.retention.ms",
-      config::shard_local_cfg().delete_retention_ms(),
-      describe_configs_source::static_broker_config);
+      config::shard_local_cfg().delete_retention_ms,
+      include_synonyms,
+      [](const std::chrono::milliseconds& ms) {
+          return ssx::sformat("{}", ms.count());
+      });
+
+    add_broker_config(
+      result,
+      "num.partitions",
+      config::shard_local_cfg().default_topic_partitions,
+      include_synonyms,
+      &describe_as_string<int32_t>);
+
+    add_broker_config(
+      result,
+      "default.replication.factor",
+      config::shard_local_cfg().default_topic_replication,
+      include_synonyms,
+      &describe_as_string<int16_t>);
+
+    add_broker_config(
+      result,
+      "log.dirs",
+      config::shard_local_cfg().data_directory,
+      include_synonyms,
+      [](const config::data_directory_path& path) {
+          return path.as_sstring();
+      });
+}
+
+int64_t describe_retention_duration(
+  tristate<std::chrono::milliseconds>& overrides,
+  std::optional<std::chrono::milliseconds> def) {
+    if (overrides.is_disabled()) {
+        return -1;
+    }
+    if (overrides.has_value()) {
+        return overrides.value().count();
+    }
+
+    return def ? def->count() : -1;
+}
+int64_t describe_retention_bytes(
+  tristate<size_t>& overrides, std::optional<size_t> def) {
+    if (overrides.is_disabled()) {
+        return -1;
+    }
+    if (overrides.has_value()) {
+        return overrides.value();
+    }
+
+    return def.value_or(-1);
 }
 
 template<>
 ss::future<response_ptr> describe_configs_handler::handle(
-  request_context&& ctx, [[maybe_unused]] ss::smp_service_group ssg) {
+  request_context ctx, [[maybe_unused]] ss::smp_service_group ssg) {
     describe_configs_request request;
     request.decode(ctx.reader(), ctx.header().version);
     klog.trace("Handling request {}", request);
 
     describe_configs_response response;
     response.data.results.reserve(request.data.resources.size());
+    bool cluster_authorized = ctx.authorized(
+      security::acl_operation::describe_configs,
+      security::default_cluster_name);
 
     for (auto& resource : request.data.resources) {
         response.data.results.push_back(describe_configs_result{
@@ -155,6 +334,14 @@ ss::future<response_ptr> describe_configs_handler::handle(
                 continue;
             }
 
+            if (!ctx.authorized(
+                  security::acl_operation::describe_configs, topic.tp)) {
+                result.error_code = error_code::topic_authorization_failed;
+                continue;
+            }
+            /**
+             * Redpanda extensions
+             */
             add_config(
               result,
               "partition_count",
@@ -166,18 +353,75 @@ ss::future<response_ptr> describe_configs_handler::handle(
               "replication_factor",
               topic_config->replication_factor,
               describe_configs_source::topic);
-
-            add_config(
+            /**
+             * Kafka properties
+             */
+            add_topic_config(
               result,
-              "cleanup.policy",
-              describe_topic_cleanup_policy(topic_config),
-              describe_configs_source::topic);
+              config::shard_local_cfg().log_compression_type.name(),
+              ctx.metadata_cache().get_default_compression(),
+              topic_property_compression,
+              topic_config->properties.compression,
+              request.data.include_synonyms,
+              &describe_as_string<model::compression>);
+
+            add_topic_config(
+              result,
+              config::shard_local_cfg().log_cleanup_policy.name(),
+              ctx.metadata_cache().get_default_cleanup_policy_bitflags(),
+              topic_property_cleanup_policy,
+              topic_config->properties.cleanup_policy_bitflags,
+              request.data.include_synonyms,
+              &describe_as_string<model::cleanup_policy_bitflags>);
+
+            add_topic_config(
+              result,
+              topic_config->properties.is_compacted()
+                ? config::shard_local_cfg().compacted_log_segment_size.name()
+                : config::shard_local_cfg().log_segment_size.name(),
+              topic_config->properties.is_compacted()
+                ? ctx.metadata_cache()
+                    .get_default_compacted_topic_segment_size()
+                : ctx.metadata_cache().get_default_segment_size(),
+              topic_property_segment_size,
+              topic_config->properties.segment_size,
+              request.data.include_synonyms,
+              &describe_as_string<size_t>);
+
+            add_topic_config(
+              result,
+              config::shard_local_cfg().delete_retention_ms.name(),
+              ctx.metadata_cache().get_default_retention_duration(),
+              topic_property_retention_duration,
+              topic_config->properties.retention_duration,
+              request.data.include_synonyms);
+
+            add_topic_config(
+              result,
+              config::shard_local_cfg().retention_bytes.name(),
+              ctx.metadata_cache().get_default_retention_bytes(),
+              topic_property_retention_bytes,
+              topic_config->properties.retention_bytes,
+              request.data.include_synonyms);
+
+            add_topic_config(
+              result,
+              config::shard_local_cfg().log_message_timestamp_type.name(),
+              ctx.metadata_cache().get_default_timestamp_type(),
+              topic_property_timestamp_type,
+              topic_config->properties.timestamp_type,
+              request.data.include_synonyms,
+              &describe_as_string<model::timestamp_type>);
 
             break;
         }
 
         case config_resource_type::broker:
-            report_broker_config(result);
+            if (!cluster_authorized) {
+                result.error_code = error_code::cluster_authorization_failed;
+                continue;
+            }
+            report_broker_config(result, request.data.include_synonyms);
             break;
 
         // resource types not yet handled

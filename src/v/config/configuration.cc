@@ -102,6 +102,12 @@ configuration::configuration()
       "Milliseconds for raft leader heartbeats",
       required::no,
       std::chrono::milliseconds(150))
+  , raft_heartbeat_timeout_ms(
+      *this,
+      "raft_heartbeat_timeout_ms",
+      "raft heartbeat RPC timeout",
+      required::no,
+      3s)
   , seed_servers(
       *this,
       "seed_servers",
@@ -125,8 +131,8 @@ configuration::configuration()
       "kafka_api_tls",
       "TLS configuration for Kafka API endpoint",
       required::no,
-      tls_config(),
-      tls_config::validate)
+      {},
+      endpoint_tls_config::validate_many)
   , use_scheduling_groups(
       *this,
       "use_scheduling_groups",
@@ -227,6 +233,52 @@ configuration::configuration()
       "Interaval for metadata dissemination batching",
       required::no,
       3'000ms)
+  , metadata_dissemination_retry_delay_ms(
+      *this,
+      "metadata_dissemination_retry_delay_ms",
+      "Delay before retry a topic lookup in a shard or other meta tables",
+      required::no,
+      0'100ms)
+  , metadata_dissemination_retries(
+      *this,
+      "metadata_dissemination_retries",
+      "Number of attempts of looking up a topic's meta data like shard before "
+      "failing a request",
+      required::no,
+      10)
+  , stm_snapshot_recovery_policy(
+      *this,
+      "stm_snapshot_recovery_policy",
+      "Describes how to recover from an invariant violation happened "
+      "during reading a stm snapshot",
+      required::no,
+      model::violation_recovery_policy::crash)
+  , tm_sync_timeout_ms(
+      *this,
+      "tm_sync_timeout_ms",
+      "Time to wait state catch up before rejecting a request",
+      required::no,
+      2000ms)
+  , tm_violation_recovery_policy(
+      *this,
+      "tm_violation_recovery_policy",
+      "Describes how to recover from an invariant violation happened on the "
+      "transaction coordinator level",
+      required::no,
+      model::violation_recovery_policy::crash)
+  , rm_sync_timeout_ms(
+      *this,
+      "rm_sync_timeout_ms",
+      "Time to wait state catch up before rejecting a request",
+      required::no,
+      2000ms)
+  , rm_violation_recovery_policy(
+      *this,
+      "rm_violation_recovery_policy",
+      "Describes how to recover from an invariant violation happened on the "
+      "partition level",
+      required::no,
+      model::violation_recovery_policy::crash)
   , fetch_reads_debounce_timeout(
       *this,
       "fetch_reads_debounce_timeout",
@@ -234,6 +286,31 @@ configuration::configuration()
       "wasn't reached",
       required::no,
       1ms)
+  , alter_topic_cfg_timeout_ms(
+      *this,
+      "alter_topic_cfg_timeout_ms",
+      "Time to wait for entries replication in controller log when executing "
+      "alter configuration requst",
+      required::no,
+      5s)
+  , log_cleanup_policy(
+      *this,
+      "log_cleanup_policy",
+      "Default topic cleanup policy",
+      required::no,
+      model::cleanup_policy_bitflags::deletion)
+  , log_message_timestamp_type(
+      *this,
+      "log_message_timestamp_type",
+      "Default topic messages timestamp type",
+      required::no,
+      model::timestamp_type::create_time)
+  , log_compression_type(
+      *this,
+      "log_compression_type",
+      "Default topic compression type",
+      required::no,
+      model::compression::producer)
   , transactional_id_expiration_ms(
       *this,
       "transactional_id_expiration_ms",
@@ -247,6 +324,8 @@ configuration::configuration()
       "Enable idempotent producer",
       required::no,
       false)
+  , enable_transactions(
+      *this, "enable_transactions", "Enable transactions", required::no, false)
   , delete_retention_ms(
       *this,
       "delete_retention_ms",
@@ -454,18 +533,79 @@ configuration::configuration()
       "Enable SASL authentication for Kafka connections.",
       required::no,
       false)
-  , static_scram_user(
+  , controller_backend_housekeeping_interval_ms(
       *this,
-      "static_scram_user",
-      "A SASL SCRAM user for testing",
+      "controller_backend_housekeeping_interval_ms",
+      "Interval between iterations of controller backend housekeeping loop",
       required::no,
-      "")
-  , static_scram_pass(
+      1s)
+  , cloud_storage_enabled(
       *this,
-      "static_scram_pass",
-      "A SASL SCRAM password for testing",
+      "cloud_storage_enabled",
+      "Enable archival storage",
       required::no,
-      "")
+      false)
+  , cloud_storage_access_key(
+      *this,
+      "cloud_storage_access_key",
+      "AWS access key",
+      required::no,
+      std::nullopt)
+  , cloud_storage_secret_key(
+      *this,
+      "cloud_storage_secret_key",
+      "AWS secret key",
+      required::no,
+      std::nullopt)
+  , cloud_storage_region(
+      *this,
+      "cloud_storage_region",
+      "AWS region that houses the bucket used for storage",
+      required::no,
+      std::nullopt)
+  , cloud_storage_bucket(
+      *this,
+      "cloud_storage_bucket",
+      "AWS bucket that should be used to store data",
+      required::no,
+      std::nullopt)
+  , cloud_storage_api_endpoint(
+      *this,
+      "cloud_storage_api_endpoint",
+      "Optional API endpoint",
+      required::no,
+      std::nullopt)
+  , cloud_storage_reconciliation_ms(
+      *this,
+      "cloud_storage_reconciliation_interval_ms",
+      "Interval at which the archival service runs reconciliation (ms)",
+      required::no,
+      10s)
+  , cloud_storage_max_connections(
+      *this,
+      "cloud_storage_max_connections",
+      "Max number of simultaneous uploads to S3",
+      required::no,
+      20)
+  , cloud_storage_disable_tls(
+      *this,
+      "cloud_storage_disable_tls",
+      "Disable TLS for all S3 connections",
+      required::no,
+      false)
+  , cloud_storage_api_endpoint_port(
+      *this,
+      "cloud_storage_api_endpoint_port",
+      "TLS port override",
+      required::no,
+      443)
+  , cloud_storage_trust_file(
+      *this,
+      "cloud_storage_trust_file",
+      "Path to certificate that should be used to validate server certificate "
+      "during TLS handshake",
+      required::no,
+      std::nullopt)
   , _advertised_kafka_api(
       *this,
       "advertised_kafka_api",

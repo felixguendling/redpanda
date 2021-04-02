@@ -11,6 +11,7 @@ package resources
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"reflect"
@@ -25,7 +26,7 @@ import (
 
 const requeueDuration = time.Second * 10
 
-// updateStsImage handles image changes in the redpanda cluster CR by triggering
+// runPartitionedUpdate handles image changes in the redpanda cluster CR by triggering
 // a rolling update (using partitions) against the statefulset underneath the CR.
 // The partitioned rolling update allows us to verify the ith pod in a custom manner
 // before proceeding to the next pod.
@@ -42,32 +43,17 @@ const requeueDuration = time.Second * 10
 // verify the previously updated pod and requeue as necessary. Currently, the
 // verification checks the pod has started listening in its Kafka API port and may be
 // extended.
-func (r *StatefulSetResource) updateStsImage(
+func (r *StatefulSetResource) runPartitionedUpdate(
 	ctx context.Context, sts *appsv1.StatefulSet,
 ) error {
-	upgrading := r.pandaCluster.Status.Upgrading
+	newImage := r.pandaCluster.FullImageName()
 
-	rpContainer, err := findContainer(sts.Spec.Template.Spec.Containers, redpandaContainerName)
-	if err != nil {
+	if err := r.updateUpgradingStatus(ctx, true); err != nil {
 		return err
 	}
 
-	newImage := r.pandaCluster.FullImageName()
-	if rpContainer.Image == newImage && !upgrading {
-		return nil
-	}
-
-	if rpContainer.Image != newImage {
-		r.logger.Info("Starting cluster image update", "cluster image", newImage, "container image", rpContainer.Image)
-
-		// Mark cluster as being upgraded.
-		if err := r.updateUpgradingStatus(ctx, true); err != nil {
-			return err
-		}
-	}
-
-	if upgrading {
-		r.logger.Info("Continuing cluster image update", "cluster image", newImage)
+	if r.pandaCluster.Status.Upgrading {
+		r.logger.Info("Continuing cluster partitioned update", "cluster image", newImage)
 	}
 
 	podSpec := &sts.Spec.Template.Spec
@@ -85,6 +71,21 @@ func (r *StatefulSetResource) updateStsImage(
 	}
 
 	return nil
+}
+
+// shouldUsePartitionedUpdate returns true if changes on the CR require partitioned update
+func (r *StatefulSetResource) shouldUsePartitionedUpdate(
+	sts *appsv1.StatefulSet,
+) (bool, error) {
+	upgrading := r.pandaCluster.Status.Upgrading
+
+	rpContainer, err := findContainer(sts.Spec.Template.Spec.Containers, redpandaContainerName)
+	if err != nil {
+		return false, err
+	}
+
+	newImage := r.pandaCluster.FullImageName()
+	return rpContainer.Image != newImage || upgrading, nil
 }
 
 func (r *StatefulSetResource) updateUpgradingStatus(
@@ -125,24 +126,24 @@ func (r *StatefulSetResource) partitionUpdateImage(
 
 		// Before continuing to update the ith Pod, verify that the previously updated
 		// Pod (if any) has rejoined its groups after restarting, i.e., is ready for I/O.
-		if err := r.ensureRedpandaGroupsReady(sts, replicas, ordinal+1); err != nil {
-			return &NeedToReconcileError{RequeueAfter: requeueDuration,
-				Msg:	fmt.Sprintf("redpanda on pod (ordinal: %d) not ready", ordinal)}
+		if err := r.ensureRedpandaGroupsReady(ctx, sts, replicas, ordinal+1); err != nil {
+			return &RequeueAfterError{RequeueAfter: requeueDuration,
+				Msg: fmt.Sprintf("redpanda on pod (ordinal: %d) not ready", ordinal)}
 		}
 
-		if err := r.rollingUpdatePartition(ctx, sts, ordinal); err != nil {
+		if err := r.rollingUpdatePartition(ctx, ordinal, sts); err != nil {
 			return err
 		}
 
 		// Restarting the Pod takes enough time to warrant a requeue.
-		return &NeedToReconcileError{RequeueAfter: requeueDuration,
-			Msg:	fmt.Sprintf("wait for pod (ordinal: %d) to restart", ordinal)}
+		return &RequeueAfterError{RequeueAfter: requeueDuration,
+			Msg: fmt.Sprintf("wait for pod (ordinal: %d) to restart", ordinal)}
 	}
 
 	// Ensure 0th Pod is ready for I/O before completing the upgrade.
-	if err := r.ensureRedpandaGroupsReady(sts, replicas, 0); err != nil {
-		return &NeedToReconcileError{RequeueAfter: requeueDuration,
-			Msg:	fmt.Sprintf("redpanda on pod (ordinal: %d) not ready", 0)}
+	if err := r.ensureRedpandaGroupsReady(ctx, sts, replicas, 0); err != nil {
+		return &RequeueAfterError{RequeueAfter: requeueDuration,
+			Msg: fmt.Sprintf("redpanda on pod (ordinal: %d) not ready", 0)}
 	}
 
 	return nil
@@ -151,7 +152,7 @@ func (r *StatefulSetResource) partitionUpdateImage(
 // Ensures the Redpanda pod has rejoined its groups after restarting,
 // i.e., is ready for I/O.
 func (r *StatefulSetResource) ensureRedpandaGroupsReady(
-	sts *appsv1.StatefulSet, replicas, ordinal int32,
+	ctx context.Context, sts *appsv1.StatefulSet, replicas, ordinal int32,
 ) error {
 	if replicas == 0 || ordinal == replicas {
 		return nil
@@ -162,14 +163,14 @@ func (r *StatefulSetResource) ensureRedpandaGroupsReady(
 
 	addresses := []string{fmt.Sprintf("%s-%d.%s", sts.Name, ordinal, headlessServiceWithPort)}
 
-	return queryRedpandaForTopicMembers(addresses, r.logger)
+	return r.queryRedpandaForTopicMembers(ctx, addresses, r.logger)
 }
 
 // Used as a temporary indicator that Redpanda is ready until a health
 // endpoint is introduced or logic is added here that goes through all topics
 // metadata.
-func queryRedpandaForTopicMembers(
-	addresses []string, logger logr.Logger,
+func (r *StatefulSetResource) queryRedpandaForTopicMembers(
+	ctx context.Context, addresses []string, logger logr.Logger,
 ) error {
 	logger.Info("Connect to Redpanda broker", "broker", addresses)
 
@@ -178,6 +179,20 @@ func queryRedpandaForTopicMembers(
 	conf.ClientID = "operator"
 	conf.Admin.Timeout = time.Second
 
+	tlsConfig := tls.Config{MinVersion: tls.VersionTLS12} // TLS12 is min version allowed by gosec.
+	if r.pandaCluster.Spec.Configuration.TLS.KafkaAPI.Enabled {
+		// For simplicity, we skip broker verification until per-listener
+		// TLS is available in Redpanda. This client calls the internal listener.
+		tlsConfig.InsecureSkipVerify = true
+
+		if err := r.populateTLSConfigCert(ctx, &tlsConfig); err != nil {
+			return err
+		}
+
+		conf.Net.TLS.Enable = true
+		conf.Net.TLS.Config = &tlsConfig
+	}
+
 	consumer, err := sarama.NewConsumer(addresses, conf)
 	if err != nil {
 		logger.Error(err, "Error while creating consumer")
@@ -185,6 +200,31 @@ func queryRedpandaForTopicMembers(
 	}
 
 	return consumer.Close()
+}
+
+// Populates crypto/TLS configuration for certificate used by the operator
+// during its client authentication.
+func (r *StatefulSetResource) populateTLSConfigCert(
+	ctx context.Context, tlsConfig *tls.Config,
+) error {
+	if !r.pandaCluster.Spec.Configuration.TLS.KafkaAPI.RequireClientAuth {
+		return nil
+	}
+
+	var certSecret corev1.Secret
+	err := r.Get(ctx, r.internalClientCertSecretKey, &certSecret)
+	if err != nil {
+		return err
+	}
+
+	cert, err := tls.X509KeyPair(certSecret.Data[corev1.TLSCertKey], certSecret.Data[corev1.TLSPrivateKeyKey])
+	if err != nil {
+		return err
+	}
+
+	tlsConfig.Certificates = []tls.Certificate{cert}
+
+	return nil
 }
 
 func (r *StatefulSetResource) podImageIdenticalToClusterImage(
@@ -208,17 +248,6 @@ func (r *StatefulSetResource) podImageIdenticalToClusterImage(
 		return containerHasWrongImageError(podName, container.Name, container.Image, newImage)
 	}
 
-	container, err = findContainer(pod.Spec.InitContainers, configuratorContainerName)
-	if err != nil {
-		return err
-	}
-
-	if container.Image != newImage {
-		r.logger.Info("Init container image not updated to cluster image", "pod", pod.Name,
-			"container", container.Name, "container image", container.Image, "cluster image", newImage)
-		return containerHasWrongImageError(podName, container.Name, container.Image, newImage)
-	}
-
 	if !podIsReady(&pod) {
 		r.logger.Info("Pod not ready yet", "pod", pod.Name)
 		return podNotReadyError(pod.Name)
@@ -231,14 +260,19 @@ func (r *StatefulSetResource) podImageIdenticalToClusterImage(
 }
 
 func (r *StatefulSetResource) rollingUpdatePartition(
-	ctx context.Context, sts *appsv1.StatefulSet, ordinal int32,
+	ctx context.Context, ordinal int32, sts *appsv1.StatefulSet,
 ) error {
 	r.logger.Info("Call update on statefulset", "ordinal", ordinal)
 
-	sts.Spec.UpdateStrategy.RollingUpdate = &appsv1.RollingUpdateStatefulSetStrategy{
+	modified, err := r.obj()
+	if err != nil {
+		return err
+	}
+	modifiedSts := modified.(*appsv1.StatefulSet)
+	modifiedSts.Spec.UpdateStrategy.RollingUpdate = &appsv1.RollingUpdateStatefulSetStrategy{
 		Partition: &ordinal,
 	}
-	if err := r.Update(ctx, sts); err != nil {
+	if err := Update(ctx, sts, modifiedSts, r.Client, r.logger); err != nil {
 		return fmt.Errorf("failed to update StatefulSet (ordinal %d): %w", ordinal, err)
 	}
 
@@ -248,15 +282,7 @@ func (r *StatefulSetResource) rollingUpdatePartition(
 func (r *StatefulSetResource) modifyPodImage(
 	stsSpec *corev1.PodSpec, newImage string,
 ) error {
-	if err := modifyContainerImage(stsSpec.InitContainers, configuratorContainerName, newImage); err != nil {
-		return err
-	}
-
-	if err := modifyContainerImage(stsSpec.Containers, redpandaContainerName, newImage); err != nil {
-		return err
-	}
-
-	return nil
+	return modifyContainerImage(stsSpec.Containers, redpandaContainerName, newImage)
 }
 
 func modifyContainerImage(
@@ -295,14 +321,14 @@ func podIsReady(pod *corev1.Pod) bool {
 	return false
 }
 
-// NeedToReconcileError error carrying the time after which to requeue.
-type NeedToReconcileError struct {
-	RequeueAfter	time.Duration
-	Msg		string
+// RequeueAfterError error carrying the time after which to requeue.
+type RequeueAfterError struct {
+	RequeueAfter time.Duration
+	Msg          string
 }
 
-func (e *NeedToReconcileError) Error() string {
-	return fmt.Sprintf("NeedToReconcileError %s", e.Msg)
+func (e *RequeueAfterError) Error() string {
+	return fmt.Sprintf("RequeueAfterError %s", e.Msg)
 }
 
 var errContainerHasWrongImage = errors.New("container has wrong image")

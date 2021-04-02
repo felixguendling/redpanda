@@ -124,6 +124,14 @@ public:
     std::optional<model::node_id> get_leader_id() const {
         return _leader_id ? std::make_optional(_leader_id->id()) : std::nullopt;
     }
+    /**
+     * Sends a round of heartbeats to followers, when majority of followers
+     * replied with success to either this of any following request all reads up
+     * to returned offsets are linearizable. (i.e. majority of followers have
+     * updated their commit indices to at least reaturned offset). For more
+     * details see paragraph 6.4 of Raft protocol dissertation.
+     */
+    ss::future<result<model::offset>> linearizable_barrier();
 
     vnode self() const { return _self; }
     protocol_metadata meta() const {
@@ -278,9 +286,17 @@ public:
 
     storage::log& log() { return _log; }
 
-    bool are_heartbeats_suppressed(vnode) const;
+    /**
+     * In our raft implementation heartbeats are sent outside of the consensus
+     * lock. In order to prevent reordering and do not flood followers with
+     * heartbeats that they will not be able to respond to we suppress sending
+     * heartbeats when other append entries request or heartbeat request is in
+     * flight.
+     */
+    heartbeats_suppressed are_heartbeats_suppressed(vnode) const;
 
-    void suppress_heartbeats(vnode, follower_req_seq, bool);
+    void update_suppress_heartbeats(
+      vnode, follower_req_seq, heartbeats_suppressed);
 
 private:
     friend replicate_entries_stm;
@@ -342,7 +358,7 @@ private:
     ss::future<> do_maybe_update_leader_commit_idx(ss::semaphore_units<>);
 
     model::term_id get_term(model::offset);
-
+    clock_type::time_point majority_heartbeat() const;
     /*
      * Start an election. When leadership transfer is requested, the election is
      * started immediately, and the vote request will contain a flag that
@@ -515,6 +531,7 @@ private:
     consistency_level _last_write_consistency_level;
     offset_monitor _consumable_offset_monitor;
     ss::condition_variable _disk_append;
+    ss::condition_variable _follower_reply;
     append_entries_buffer _append_requests_buffer;
     friend std::ostream& operator<<(std::ostream&, const consensus&);
 };

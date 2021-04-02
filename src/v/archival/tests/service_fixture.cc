@@ -343,7 +343,7 @@ void segment_matcher<Fixture>::verify_segment(
     auto tmp = stream.read_exactly(size).get0();
     ss::sstring actual = {tmp.get(), tmp.size()};
     vlog(
-      fixt_log.error,
+      fixt_log.info,
       "expected {} bytes, got {}",
       expected.size(),
       actual.size());
@@ -367,7 +367,6 @@ void segment_matcher<Fixture>::verify_manifest(const archival::manifest& man) {
         BOOST_REQUIRE_EQUAL(comm, m->committed_offset);
         BOOST_REQUIRE_EQUAL(size, m->size_bytes);
         BOOST_REQUIRE_EQUAL(comp, m->is_compacted);
-        BOOST_REQUIRE_EQUAL(false, m->is_deleted_locally);
     }
 }
 

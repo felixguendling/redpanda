@@ -35,6 +35,7 @@
 #include <boost/container_hash/extensions.hpp>
 #include <fmt/ostream.h>
 
+#include <chrono>
 #include <string_view>
 
 namespace kafka {
@@ -326,14 +327,15 @@ static ss::future<produce_response::partition> produce_topic_partition(
      * metadata cache. For append time setting we have to recalculate
      * the CRC.
      */
-    auto timestamp_type = octx.rctx.metadata_cache().get_topic_timestamp_type(
-      model::topic_namespace_view(model::kafka_namespace, topic.name));
+    auto timestamp_type
+      = octx.rctx.metadata_cache()
+          .get_topic_timestamp_type(
+            model::topic_namespace_view(model::kafka_namespace, topic.name))
+          .value_or(octx.rctx.metadata_cache().get_default_timestamp_type());
 
     if (timestamp_type == model::timestamp_type::append_time) {
-        auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
-          ss::lowres_clock::now().time_since_epoch());
         batch.set_max_timestamp(
-          model::timestamp_type::append_time, model::timestamp(now.count()));
+          model::timestamp_type::append_time, model::timestamp::now());
     }
 
     const auto& hdr = batch.header();
@@ -381,6 +383,15 @@ produce_topic(produce_ctx& octx, produce_request::topic& topic) {
     partitions.reserve(topic.partitions.size());
 
     for (auto& part : topic.partitions) {
+        if (!octx.rctx.authorized(security::acl_operation::write, topic.name)) {
+            partitions.push_back(
+              ss::make_ready_future<produce_response::partition>(
+                produce_response::partition{
+                  .id = part.id,
+                  .error = error_code::topic_authorization_failed}));
+            continue;
+        }
+
         if (!octx.rctx.metadata_cache().contains(
               model::topic_namespace_view(model::kafka_namespace, topic.name),
               part.id)) {
@@ -444,7 +455,7 @@ produce_topics(produce_ctx& octx) {
 
 template<>
 ss::future<response_ptr>
-produce_handler::handle(request_context&& ctx, ss::smp_service_group ssg) {
+produce_handler::handle(request_context ctx, ss::smp_service_group ssg) {
     produce_request request(ctx);
 
     /*
@@ -456,14 +467,34 @@ produce_handler::handle(request_context&& ctx, ss::smp_service_group ssg) {
      * authorization failed.
      */
     if (request.has_transactional) {
+        // will be removed when all of transactions are implemented
         return ctx.respond(request.make_error_response(
           error_code::transactional_id_authorization_failed));
 
+        if (
+          !request.transactional_id
+          || !ctx.authorized(
+            security::acl_operation::write,
+            transactional_id(*request.transactional_id))) {
+            return ctx.respond(request.make_error_response(
+              error_code::transactional_id_authorization_failed));
+        }
+        // <kafka>Note that authorization to a transactionalId implies
+        // ProducerId authorization</kafka>
+
     } else if (request.has_idempotent) {
+        if (!ctx.authorized(
+              security::acl_operation::idempotent_write,
+              security::default_cluster_name)) {
+            return ctx.respond(request.make_error_response(
+              error_code::cluster_authorization_failed));
+        }
+
         if (!ctx.is_idempotence_enabled()) {
             return ctx.respond(request.make_error_response(
               error_code::cluster_authorization_failed));
         }
+
     } else if (request.acks < -1 || request.acks > 1) {
         // from kafka source: "if required.acks is outside accepted
         // range, something is wrong with the client Just return an

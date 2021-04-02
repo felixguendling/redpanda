@@ -11,6 +11,7 @@
 
 #include "cluster/members_manager.h"
 #include "cluster/metadata_cache.h"
+#include "cluster/security_frontend.h"
 #include "cluster/topics_frontend.h"
 #include "cluster/types.h"
 #include "config/configuration.h"
@@ -26,11 +27,13 @@ service::service(
   ss::smp_service_group ssg,
   ss::sharded<topics_frontend>& tf,
   ss::sharded<members_manager>& mm,
-  ss::sharded<metadata_cache>& cache)
+  ss::sharded<metadata_cache>& cache,
+  ss::sharded<security_frontend>& sf)
   : controller_service(sg, ssg)
   , _topics_frontend(tf)
   , _members_manager(mm)
-  , _md_cache(cache) {}
+  , _md_cache(cache)
+  , _security_frontend(sf) {}
 
 ss::future<join_reply>
 service::join(join_request&& req, rpc::streaming_context&) {
@@ -127,6 +130,39 @@ service::do_finish_partition_update(finish_partition_update_request&& req) {
     errc e = ec ? errc::not_leader : errc::success;
 
     co_return finish_partition_update_reply{.result = e};
+}
+
+ss::future<update_topic_properties_reply> service::update_topic_properties(
+  update_topic_properties_request&& req, rpc::streaming_context&) {
+    return ss::with_scheduling_group(
+      get_scheduling_group(), [this, req = std::move(req)]() mutable {
+          return do_update_topic_properties(std::move(req));
+      });
+}
+
+ss::future<update_topic_properties_reply>
+service::do_update_topic_properties(update_topic_properties_request&& req) {
+    // local topic frontend instance will eventually dispatch request to _raft0
+    // core
+    auto res = co_await _topics_frontend.local().update_topic_properties(
+      req.updates,
+      config::shard_local_cfg().replicate_append_timeout_ms()
+        + model::timeout_clock::now());
+
+    co_return update_topic_properties_reply{.results = std::move(res)};
+}
+
+ss::future<create_acls_reply>
+service::create_acls(create_acls_request&& request, rpc::streaming_context&) {
+    return ss::with_scheduling_group(
+             get_scheduling_group(),
+             [this, r = std::move(request)]() mutable {
+                 return _security_frontend.local().create_acls(
+                   std::move(r.data.bindings), r.timeout);
+             })
+      .then([](std::vector<errc> results) {
+          return create_acls_reply{.results = std::move(results)};
+      });
 }
 
 } // namespace cluster

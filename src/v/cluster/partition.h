@@ -13,11 +13,13 @@
 
 #include "cluster/id_allocator_stm.h"
 #include "cluster/partition_probe.h"
-#include "cluster/seq_stm.h"
+#include "cluster/rm_stm.h"
 #include "cluster/types.h"
+#include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/record_batch_reader.h"
 #include "raft/consensus.h"
+#include "raft/consensus_utils.h"
 #include "raft/group_configuration.h"
 #include "raft/log_eviction_stm.h"
 #include "raft/types.h"
@@ -86,14 +88,20 @@ public:
      * kafka clients, simply report the next offset.
      */
     model::offset last_stable_offset() const {
-        return _raft->last_stable_offset() + model::offset(1);
+        return raft::details::next_offset(_raft->last_stable_offset());
     }
 
     /**
-     * Greatest offset visible to consumers. Named high_watermark to be
-     * consistent with Kafka nomenclature.
+     * All batches with offets smaller than high watermark are visible to
+     * consumers. Named high_watermark to be consistent with Kafka nomenclature.
      */
-    model::offset high_watermark() const { return _raft->last_visible_index(); }
+    model::offset high_watermark() const {
+        return raft::details::next_offset(_raft->last_visible_index());
+    }
+
+    model::offset dirty_offset() const {
+        return _raft->log().offsets().dirty_offset;
+    }
 
     const model::ntp& ntp() const { return _raft->ntp(); }
 
@@ -131,6 +139,11 @@ public:
         return _id_allocator_stm;
     }
 
+    ss::shared_ptr<cluster::rm_stm>& rm_stm() { return _rm_stm; }
+
+    size_t size_bytes() const { return _raft->log().size_bytes(); }
+    ss::future<> update_configuration(topic_properties);
+
 private:
     friend partition_manager;
 
@@ -140,7 +153,7 @@ private:
     consensus_ptr _raft;
     ss::lw_shared_ptr<raft::log_eviction_stm> _nop_stm;
     ss::lw_shared_ptr<cluster::id_allocator_stm> _id_allocator_stm;
-    ss::shared_ptr<seq_stm> _seq_stm;
+    ss::shared_ptr<cluster::rm_stm> _rm_stm;
     ss::abort_source _as;
     partition_probe _probe;
 

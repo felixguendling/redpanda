@@ -7,18 +7,52 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0
 
+import http.client
 import json
+import logging
 import uuid
 import requests
-import time
 from ducktape.mark.resource import cluster
-from ducktape.utils.util import wait_until
 
 from rptest.clients.types import TopicSpec
 from rptest.clients.kafka_cat import KafkaCat
 from rptest.clients.kafka_cli_tools import KafkaCliTools
 from rptest.tests.redpanda_test import RedpandaTest
-from rptest.services.pandaproxy import PandaProxyService
+
+
+def create_topic_names(count):
+    return list(f"pandaproxy-topic-{uuid.uuid4()}" for _ in range(count))
+
+
+HTTP_GET_TOPICS_HEADERS = {
+    "Accept": "application/vnd.kafka.v2+json",
+    "Content-Type": "application/vnd.kafka.v2+json"
+}
+
+HTTP_FETCH_TOPIC_HEADERS = {
+    "Accept": "application/vnd.kafka.binary.v2+json",
+    "Content-Type": "application/vnd.kafka.v2+json"
+}
+
+HTTP_PRODUCE_TOPIC_HEADERS = {
+    "Accept": "application/vnd.kafka.v2+json",
+    "Content-Type": "application/vnd.kafka.binary.v2+json"
+}
+
+
+class Consumer:
+    def __init__(self, res):
+        self.instance_id = res["instance_id"]
+        self.base_uri = res["base_uri"]
+
+    def subscribe(self, topics):
+        res = requests.post(f"{self.base_uri}/subscription",
+                            json.dumps({"topics": topics}))
+        return res
+
+    def remove(self):
+        res = requests.delete(self.base_uri)
+        return res
 
 
 class PandaProxyTest(RedpandaTest):
@@ -26,75 +60,36 @@ class PandaProxyTest(RedpandaTest):
     Test pandaproxy against a redpanda cluster.
     """
     def __init__(self, context):
-        super(PandaProxyTest, self).__init__(context, num_brokers=3)
-        self._pandaproxy = PandaProxyService(context, self.redpanda)
+        super(PandaProxyTest, self).__init__(
+            context,
+            num_brokers=3,
+            enable_pp=True,
+            extra_rp_conf={"auto_create_topics_enabled": False})
 
-    def setup(self):
-        super(PandaProxyTest, self).setup()
-        self._pandaproxy.start()
+        http.client.HTTPConnection.debuglevel = 1
+        logging.basicConfig()
+        requests_log = logging.getLogger("requests.packages.urllib3")
+        requests_log.setLevel(logging.getLogger().level)
+        requests_log.propagate = True
 
-    def _get_topics(self):
-        proxy = self._pandaproxy.nodes[0]
-        url = "http://{}:8082/topics".format(proxy.account.hostname)
-        return requests.get(url).json()
+    def _base_uri(self):
+        return f"http://{self.redpanda.nodes[0].account.hostname}:8082"
 
-    def _produce_topic(self, topic, data):
-        proxy = self._pandaproxy.nodes[0]
-        url = "http://{}:8082/topics/{}".format(proxy.account.hostname, topic)
-        self.logger.info(data)
-        return requests.post(url, data).json()
-
-    @cluster(num_nodes=4)
-    def test_list_topics(self):
-        """
-        Create some topics and verify that pandaproxy lists them.
-        """
-        names = set("pandaproxy-topic-{}".format(uuid.uuid4())
-                    for _ in range(3))
-        self.logger.debug("Topic names %s", names)
-
-        prev = set(self._get_topics())
-        self.logger.debug("Existing topics %s", prev)
-        assert prev.isdisjoint(names)
-
-        self.logger.debug("Creating test topics")
+    def _create_topics(self,
+                       names=create_topic_names(1),
+                       partitions=1,
+                       replicas=1):
+        self.logger.debug(f"Creating topics: {names}")
         kafka_tools = KafkaCliTools(self.redpanda)
         for name in names:
-            kafka_tools.create_topic(TopicSpec(name=name,
-                                               replication_factor=1))
+            kafka_tools.create_topic(
+                TopicSpec(name=name,
+                          partition_count=partitions,
+                          replication_factor=replicas))
+        return names
 
-        curr = set(self._get_topics())
-        self.logger.debug("Current topics %s", curr)
-        assert names <= curr
-
-    @cluster(num_nodes=4)
-    def test_produce_topic(self):
-        """
-        Create a topic and verify that pandaproxy can produce to it.
-        """
-        name = "pandaproxy-topic-{}".format(uuid.uuid4())
-        self.logger.debug("Topic name %s", name)
-
-        prev = set(self._get_topics())
-        self.logger.debug("Existing topics %s", prev)
-        assert prev.isdisjoint(name)
-
-        data = '{"records": [{"value": "dmVjdG9yaXplZA==", "partition": 0},{"value": "cGFuZGFwcm94eQ==", "partition": 1},{"value": "bXVsdGlicm9rZXI=", "partition": 2}]}'
-
-        self.logger.debug("Producing to non-existant topic")
-        produce_result = self._produce_topic(name, data)
-        for o in produce_result["offsets"]:
-            assert o["error_code"] == 3
-            assert o["offset"] == -1
-
+    def _wait_for_topic(self, name):
         kc = KafkaCat(self.redpanda)
-
-        self.logger.debug("Creating test topic")
-        kafka_tools = KafkaCliTools(self.redpanda)
-        kafka_tools.create_topic(
-            TopicSpec(name=name, replication_factor=1, partition_count=3))
-
-        self.logger.debug("Waiting for leaders to settle")
         has_leaders = False
         while not has_leaders:
             topics = kc.metadata()["topics"]
@@ -111,13 +106,331 @@ class PandaProxyTest(RedpandaTest):
         #  The retry logic for produce should have sufficient time for this
         #  additional settle time.
 
-        self.logger.debug("Producing to topic")
-        produce_result = self._produce_topic(name, data)
-        self.logger.debug("Producing to topic: %s", produce_result)
+    def _get_topics(self, headers=HTTP_GET_TOPICS_HEADERS):
+        return requests.get(f"{self._base_uri()}/topics", headers=headers)
+
+    def _produce_topic(self, topic, data, headers=HTTP_PRODUCE_TOPIC_HEADERS):
+        return requests.post(f"{self._base_uri()}/topics/{topic}",
+                             data,
+                             headers=headers)
+
+    def _fetch_topic(self,
+                     topic,
+                     partition=0,
+                     offset=0,
+                     max_bytes=1024,
+                     timeout_ms=1000,
+                     headers=HTTP_FETCH_TOPIC_HEADERS):
+        return requests.get(
+            f"{self._base_uri()}/topics/{topic}/partitions/{partition}/records?offset={offset}&max_bytes={max_bytes}&timeout={timeout_ms}",
+            headers=headers)
+
+    def _create_consumer(self, group_id):
+        res = requests.post(
+            f"{self._base_uri()}/consumers/{group_id}", '''
+            {
+                "format": "binary",
+                "auto.offset.reset": "earliest",
+                "auto.commit.enable": "false",
+                "fetch.min.bytes": "1",
+                "consumer.request.timeout.ms": "10000"
+            }''')
+        return res
+
+    @cluster(num_nodes=3)
+    def test_list_topics_validation(self):
+        """
+        Acceptable headers:
+        * Accept: "", "*.*", "application/vnd.kafka.v2+json"
+        * Content-Type: "", "*.*", "application/vnd.kafka.v2+json"
+
+        """
+        self.logger.debug(f"List topics with no accept header")
+        result_raw = self._get_topics(
+            {"Content-Type": "application/vnd.kafka.v2+json"})
+        assert result_raw.status_code == requests.codes.ok
+        assert result_raw.headers[
+            "Content-Type"] == "application/vnd.kafka.v2+json"
+
+        self.logger.debug(f"List topics with no content-type header")
+        result_raw = self._get_topics({
+            "Accept":
+            "application/vnd.kafka.v2+json",
+        })
+        assert result_raw.status_code == requests.codes.ok
+        assert result_raw.headers[
+            "Content-Type"] == "application/vnd.kafka.v2+json"
+
+        self.logger.debug(f"List topics with generic accept header")
+        result_raw = self._get_topics({"Accept": "*/*"})
+        assert result_raw.status_code == requests.codes.ok
+        assert result_raw.headers[
+            "Content-Type"] == "application/vnd.kafka.v2+json"
+
+        self.logger.debug(f"List topics with generic content-type header")
+        result_raw = self._get_topics({"Content-Type": "*/*"})
+        assert result_raw.status_code == requests.codes.ok
+        assert result_raw.headers[
+            "Content-Type"] == "application/vnd.kafka.v2+json"
+
+        self.logger.debug(f"List topics with invalid accept header")
+        result_raw = self._get_topics({"Accept": "application/json"})
+        assert result_raw.status_code == requests.codes.not_acceptable
+        assert result_raw.headers["Content-Type"] == "application/json"
+
+        self.logger.debug(f"List topics with invalid content-type header")
+        result_raw = self._get_topics({"Content-Type": "application/json"})
+        assert result_raw.status_code == requests.codes.unsupported_media_type
+        assert result_raw.headers["Content-Type"] == "application/json"
+
+    @cluster(num_nodes=3)
+    def test_list_topics(self):
+        """
+        Create some topics and verify that pandaproxy lists them.
+        """
+        prev = set(self._get_topics())
+        self.logger.debug(f"Existing topics: {prev}")
+        names = create_topic_names(3)
+        assert prev.isdisjoint(names)
+        self.logger.info(f"Creating test topics: {names}")
+        names = set(self._create_topics(names))
+        result_raw = self._get_topics()
+        assert result_raw.status_code == requests.codes.ok
+        curr = set(result_raw.json())
+        self.logger.debug(f"Current topics: {curr}")
+        assert names <= curr
+
+    @cluster(num_nodes=3)
+    def test_produce_topic_validation(self):
+        """
+        Acceptable headers:
+        * Accept: "", "*.*", "application/vnd.kafka.v2+json"
+        * Content-Type: "application/vnd.kafka.binary.v2+json"
+
+        """
+        name = create_topic_names(1)[0]
+        data = '''
+        {
+            "records": [
+                {"value": "dmVjdG9yaXplZA==", "partition": 0},
+                {"value": "cGFuZGFwcm94eQ==", "partition": 1},
+                {"value": "bXVsdGlicm9rZXI=", "partition": 2}
+            ]
+        }'''
+
+        self.logger.info(f"Producing with no accept header")
+        produce_result_raw = self._produce_topic(
+            name,
+            data,
+            headers={"Content-Type": "application/vnd.kafka.binary.v2+json"})
+        assert produce_result_raw.status_code == requests.codes.ok
+        produce_result = produce_result_raw.json()
+        assert produce_result["offsets"][0][
+            "error_code"] == 3  # topic not found
+
+        self.logger.info(f"Producing with unsupported accept header")
+        produce_result_raw = self._produce_topic(
+            name,
+            data,
+            headers={
+                "Accept": "application/vnd.kafka.binary.v2+json",
+                "Content-Type": "application/vnd.kafka.binary.v2+json"
+            })
+        assert produce_result_raw.status_code == requests.codes.not_acceptable
+        produce_result = produce_result_raw.json()
+        assert produce_result["error_code"] == requests.codes.not_acceptable
+
+        self.logger.info(f"Producing with no content-type header")
+        produce_result_raw = self._produce_topic(
+            name, data, headers={"Accept": "application/vnd.kafka.v2+json"})
+        assert produce_result_raw.status_code == requests.codes.unsupported_media_type
+        produce_result = produce_result_raw.json()
+        assert produce_result[
+            "error_code"] == requests.codes.unsupported_media_type
+
+        self.logger.info(f"Producing with unsupported content-type header")
+        produce_result_raw = self._produce_topic(
+            name,
+            data,
+            headers={
+                "Accept": "application/vnd.kafka.v2+json",
+                "Content-Type": "application/vnd.kafka.v2+json"
+            })
+        assert produce_result_raw.status_code == requests.codes.unsupported_media_type
+        produce_result = produce_result_raw.json()
+        assert produce_result[
+            "error_code"] == requests.codes.unsupported_media_type
+
+    @cluster(num_nodes=3)
+    def test_produce_topic(self):
+        """
+        Create a topic and verify that pandaproxy can produce to it.
+        """
+        name = create_topic_names(1)[0]
+        data = '''
+        {
+            "records": [
+                {"value": "dmVjdG9yaXplZA==", "partition": 0},
+                {"value": "cGFuZGFwcm94eQ==", "partition": 1},
+                {"value": "bXVsdGlicm9rZXI=", "partition": 2}
+            ]
+        }'''
+
+        self.logger.info(f"Producing to non-existant topic: {name}")
+        produce_result_raw = self._produce_topic(name, data)
+        assert produce_result_raw.status_code == requests.codes.ok
+        produce_result = produce_result_raw.json()
+        for o in produce_result["offsets"]:
+            assert o["error_code"] == 3
+            assert o["offset"] == -1
+
+        self.logger.info(f"Creating test topic: {name}")
+        self._create_topics([name], partitions=3)
+
+        self.logger.debug("Waiting for leaders to settle")
+        self._wait_for_topic(name)
+
+        self.logger.info(f"Producing to topic: {name}")
+        produce_result_raw = self._produce_topic(name, data)
+        assert produce_result_raw.status_code == requests.codes.ok
+        assert produce_result_raw.headers[
+            "Content-Type"] == "application/vnd.kafka.v2+json"
+
+        produce_result = produce_result_raw.json()
         for o in produce_result["offsets"]:
             assert o["offset"] == 1, f'error_code {o["error_code"]}'
 
-        self.logger.debug(f"Consuming topic: {name}")
+        self.logger.info(f"Consuming from topic: {name}")
+        kc = KafkaCat(self.redpanda)
         assert kc.consume_one(name, 0, 1)["payload"] == "vectorized"
         assert kc.consume_one(name, 1, 1)["payload"] == "pandaproxy"
         assert kc.consume_one(name, 2, 1)["payload"] == "multibroker"
+
+    @cluster(num_nodes=3)
+    def test_fetch_topic_validation(self):
+        """
+        Acceptable headers:
+        * Accept: "application/vnd.kafka.binary.v2+json"
+        * Content-Type: "application/vnd.kafka.v2+json"
+        Required Params:
+        * Path:
+          * topic
+          * partition
+        * Query:
+          * offset
+          * timeout
+          * max_bytes
+        """
+        self.logger.info(f"Consuming with empty topic param")
+        fetch_raw_result = self._fetch_topic("", 0)
+        assert fetch_raw_result.status_code == requests.codes.bad_request
+
+        name = create_topic_names(1)[0]
+
+        self.logger.info(f"Consuming with empty offset param")
+        fetch_raw_result = self._fetch_topic(name, 0, "")
+        assert fetch_raw_result.status_code == requests.codes.bad_request
+
+        self.logger.info(f"Consuming from unknown topic: {name}")
+        fetch_raw_result = self._fetch_topic(name, 0)
+        assert fetch_raw_result.status_code == requests.codes.not_found
+        fetch_result = fetch_raw_result.json()
+        assert fetch_result["error_code"] == 40402
+
+        self.logger.info(f"Consuming with no content-type header")
+        fetch_raw_result = self._fetch_topic(
+            name,
+            0,
+            headers={"Accept": "application/vnd.kafka.binary.v2+json"})
+        assert fetch_raw_result.status_code == requests.codes.unsupported_media_type
+        fetch_result = fetch_raw_result.json()
+        assert fetch_result[
+            "error_code"] == requests.codes.unsupported_media_type
+
+        self.logger.info(f"Consuming with no accept header")
+        fetch_raw_result = self._fetch_topic(
+            name, 0, headers={"Content-Type": "application/vnd.kafka.v2+json"})
+        assert fetch_raw_result.status_code == requests.codes.not_acceptable
+        fetch_result = fetch_raw_result.json()
+        assert fetch_result["error_code"] == requests.codes.not_acceptable
+
+        self.logger.info(f"Consuming with unsupported accept header")
+        fetch_raw_result = self._fetch_topic(
+            name,
+            0,
+            headers={
+                "Accept": "application/vnd.kafka.v2+json",
+                "Content-Type": "application/vnd.kafka.v2+json"
+            })
+        assert fetch_raw_result.status_code == requests.codes.not_acceptable
+        fetch_result = fetch_raw_result.json()
+        assert fetch_result["error_code"] == requests.codes.not_acceptable
+
+    @cluster(num_nodes=3)
+    def test_fetch_topic(self):
+        """
+        Create a topic, publish to it, and verify that pandaproxy can fetch
+        from it.
+        """
+        name = create_topic_names(1)[0]
+
+        self.logger.info(f"Creating test topic: {name}")
+        self._create_topics([name], partitions=3)
+
+        self.logger.info("Waiting for leaders to settle")
+        self._wait_for_topic(name)
+
+        self.logger.info(f"Producing to topic: {name}")
+        data = '''
+        {
+            "records": [
+                {"value": "dmVjdG9yaXplZA==", "partition": 0},
+                {"value": "cGFuZGFwcm94eQ==", "partition": 1},
+                {"value": "bXVsdGlicm9rZXI=", "partition": 2}
+            ]
+        }'''
+        produce_result_raw = self._produce_topic(name, data)
+        assert produce_result_raw.status_code == requests.codes.ok
+        produce_result = produce_result_raw.json()
+        for o in produce_result["offsets"]:
+            assert o["offset"] == 1, f'error_code {o["error_code"]}'
+
+        self.logger.info(f"Consuming from topic: {name}")
+        fetch_raw_result_0 = self._fetch_topic(name, 0)
+        assert fetch_raw_result_0.status_code == requests.codes.ok
+        fetch_result_0 = fetch_raw_result_0.json()
+        expected = json.loads(data)
+        # The first batch is a control batch,ignore it.
+        assert fetch_result_0[1]["topic"] == name
+        assert fetch_result_0[1]["key"] == ''
+        assert fetch_result_0[1]["value"] == expected["records"][0]["value"]
+        assert fetch_result_0[1]["partition"] == expected["records"][0][
+            "partition"]
+        assert fetch_result_0[1]["offset"] == 1
+
+    @cluster(num_nodes=3)
+    def test_consumer_group(self):
+        """
+        Create a consumer group and use it
+        """
+
+        group_id = f"pandaproxy-group-{uuid.uuid4()}"
+
+        # Create 3 topics
+        topics = self._create_topics(create_topic_names(3), 3, 3)
+
+        # Create a consumer
+        self.logger.info("Create a consumer")
+        cc_res = self._create_consumer(group_id)
+        assert cc_res.status_code == requests.codes.ok
+        c0 = Consumer(cc_res.json())
+
+        # Subscribe a consumer
+        self.logger.info(f"Subscribe consumer to topics: {topics}")
+        sc_res = c0.subscribe(topics)
+        assert sc_res.status_code == requests.codes.ok
+
+        # Remove consumer
+        self.logger.info("Remove consumer")
+        rc_res = c0.remove()
+        assert rc_res.status_code == requests.codes.no_content

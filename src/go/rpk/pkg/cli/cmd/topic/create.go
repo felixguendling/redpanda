@@ -23,19 +23,19 @@ func NewCreateCommand(
 	admin func() (sarama.ClusterAdmin, error),
 ) *cobra.Command {
 	var (
-		partitions	int32
-		replicas	int16
-		compact		bool
-		config		[]string
+		partitions  int32
+		replicas    int16
+		compact     bool
+		topicConfig []string
 	)
 	cmd := &cobra.Command{
-		Use:	"create <topic name>",
-		Short:	"Create a topic",
-		Args:	common.ExactArgs(1, "topic's name is missing."),
+		Use:   "create <topic name>",
+		Short: "Create a topic",
+		Args:  common.ExactArgs(1, "topic's name is missing."),
 		// We don't want Cobra printing CLI usage help if the error isn't about CLI usage.
-		SilenceUsage:	true,
+		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			configEntries, err := parseKVs(config)
+			configEntries, err := parseKVs(topicConfig)
 			if err != nil {
 				return err
 			}
@@ -54,9 +54,9 @@ func NewCreateCommand(
 			defer adm.Close()
 			topicName := args[0]
 			topicDetail := &sarama.TopicDetail{
-				NumPartitions:		partitions,
-				ConfigEntries:		configEntries,
-				ReplicationFactor:	replicas,
+				NumPartitions:     partitions,
+				ConfigEntries:     configEntries,
+				ReplicationFactor: replicas,
 			}
 			err = adm.CreateTopic(
 				topicName,
@@ -87,8 +87,8 @@ rpk topic describe '%s'
 		},
 	}
 	cmd.Flags().StringArrayVarP(
-		&config,
-		"config",
+		&topicConfig,
+		"topic-config",
 		"c",
 		[]string{},
 		"Config entries in the format <key>:<value>. May be used multiple times"+

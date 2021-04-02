@@ -5,11 +5,9 @@ rp_test(
   BINARY_NAME test_kafka_server
   SOURCES
     error_mapping_test.cc
-    scram_algorithm_test.cc
     timeouts_conversion_test.cc
     types_conversion_tests.cc
     topic_utils_test.cc
-    credential_store_test.cc
   DEFINITIONS BOOST_TEST_DYN_LINK
   LIBRARIES Boost::unit_test_framework v::kafka
   LABELS kafka
@@ -30,6 +28,7 @@ set(srcs
   offset_commit_test.cc
   topic_recreate_test.cc
   fetch_session_test.cc
+  alter_config_test.cc
   produce_consume_test.cc)
 
 rp_test(
