@@ -38,8 +38,8 @@ struct test_msg1_new
 struct not_an_envelope {};
 static_assert(!rpc::is_envelope_v<not_an_envelope>);
 static_assert(rpc::is_envelope_v<test_msg1>);
-static_assert(test_msg1::version == 4);
-static_assert(test_msg1::compat_version == 0);
+static_assert(test_msg1::__version == 4);
+static_assert(test_msg1::__compat_version == 0);
 
 SEASTAR_THREAD_TEST_CASE(reserve_test) {
     auto b = iobuf();
@@ -160,6 +160,8 @@ struct complex_msg : rpc::envelope<complex_msg, rpc::version<3>> {
     int32_t _x;
 };
 
+static_assert(rpc::is_envelope_v<complex_msg>);
+
 SEASTAR_THREAD_TEST_CASE(complex_msg_test) {
     auto b = iobuf();
 
@@ -187,12 +189,15 @@ SEASTAR_THREAD_TEST_CASE(complex_msg_test) {
 }
 
 struct test_snapshot_header
-  : public rpc::envelope<test_snapshot_header, rpc::version<1>> {
+  : rpc::
+      envelope<test_snapshot_header, rpc::version<1>, rpc::compat_version<0>> {
     uint32_t header_crc;
     uint32_t metadata_crc;
     int8_t version;
     int32_t metadata_size;
 };
+
+static_assert(rpc::is_envelope_v<test_snapshot_header>);
 
 template<
   typename T,

@@ -173,29 +173,39 @@ struct field {
  *                         (change for every incompatible update)
  * \tparam CompatVersion   the minimum required version able to parse the type
  */
-template<typename T, typename Version, typename CompatVersion = Version>
+template<
+  typename T,
+  typename Version,
+  typename CompatVersion = compat_version<Version::v>>
 struct envelope {
     using value_t = T;
-    static constexpr auto version = Version::v;
-    static constexpr auto compat_version = CompatVersion::v;
+    static constexpr auto __version = Version::v;
+    static constexpr auto __compat_version = CompatVersion::v;
 };
 
 template<typename T>
 struct inherits_from_envelope {
+    using Type = std::decay_t<T>;
     static constexpr auto const value = std::is_base_of_v<
-      envelope<T, version<T::version>, compat_version<T::compat_version>>,
-      T>;
+      envelope<
+        Type,
+        version<Type::__version>,
+        compat_version<Type::__compat_version>>,
+      Type>;
 };
 
 template<typename T, typename = void>
-struct is_envelope : std::false_type {};
+struct has_compat_attribute : std::false_type {};
 
 template<typename T>
-struct is_envelope<T, std::void_t<decltype(std::declval<T>().compat_version)>>
+struct has_compat_attribute<
+  T,
+  std::void_t<decltype(std::declval<T>().__compat_version)>>
   : std::true_type {};
 
 template<typename T>
-inline constexpr auto const is_envelope_v = is_envelope<T>::value;
+inline constexpr auto const is_envelope_v
+  = std::conjunction_v<has_compat_attribute<T>, inherits_from_envelope<T>>;
 
 template<typename T, typename Fn>
 inline void envelope_for_each_field(T& t, Fn&& fn) {
@@ -271,8 +281,8 @@ auto write(iobuf& out, T const& t)
     using Type = std::decay_t<T>;
     static_assert(is_serializable_v<Type>);
     if constexpr (is_envelope_v<Type>) {
-        write(out, Type::version);
-        write(out, Type::compat_version);
+        write(out, Type::__version);
+        write(out, Type::__compat_version);
 
         auto size_placeholder = out.reserve(vint::max_length);
         auto const size_before = out.size_bytes();
@@ -322,12 +332,12 @@ auto read(iobuf_parser& in) -> std::
             return ss::stop_iteration::no;
         });
 
-        if (compat_version > Type::version) {
+        if (compat_version > Type::__version) {
             rpclog.error(
               "read compat_version={} > {}::version={}\n ",
               static_cast<int>(compat_version),
               cista::type_str<T>(),
-              static_cast<int>(Type::version));
+              static_cast<int>(Type::__version));
             throw std::system_error{make_error_code(
               rpc_error_codes::version_older_than_compat_version)};
         }
