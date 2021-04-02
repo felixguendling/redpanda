@@ -15,6 +15,7 @@
 #include <boost/test/unit_test.hpp>
 
 #include <chrono>
+#include <limits>
 
 struct test_msg0
   : rpc::envelope<test_msg0, rpc::version<1>, rpc::compat_version<0>> {
@@ -117,6 +118,18 @@ SEASTAR_THREAD_TEST_CASE(envelope_test_version_older_than_compat_version) {
     BOOST_CHECK(throws);
 }
 
+SEASTAR_THREAD_TEST_CASE(envelope_too_big_test) {
+    struct big
+      : public rpc::envelope<big, rpc::version<0>, rpc::compat_version<0>> {
+        std::vector<char> data_;
+    };
+
+    auto too_big = std::make_unique<big>();
+    //    too_big->data_.resize(std::numeric_limits<big::envelope_size_t>::max());
+    auto b = iobuf();
+    //    BOOST_CHECK_THROW(rpc::write(b, *too_big), std::system_error);
+}
+
 SEASTAR_THREAD_TEST_CASE(envelope_test_buffer_too_short) {
     auto b = iobuf();
 
@@ -201,7 +214,7 @@ static_assert(rpc::is_envelope_v<test_snapshot_header>);
 
 template<
   typename T,
-  rpc::mode M = rpc::mode::SYNC,
+  rpc::mode M,
   std::enable_if_t<
     M == rpc::mode::ASYNC
       && std::is_same_v<test_snapshot_header, std::decay_t<T>>,
@@ -231,6 +244,18 @@ auto read(iobuf_parser& in) -> ss::future<std::decay_t<test_snapshot_header>> {
     }
 
     return ss::make_ready_future<test_snapshot_header>(hdr);
+}
+
+template<
+  rpc::mode M = rpc::mode::ASYNC,
+  typename T,
+  std::enable_if_t<M == rpc::mode::ASYNC, void*> = nullptr>
+ss::future<> write(iobuf& out, test_snapshot_header const& t) {
+    rpc::write(out, t.header_crc);
+    rpc::write(out, t.metadata_crc);
+    rpc::write(out, t.version);
+    rpc::write(out, t.metadata_size);
+    return ss::make_ready_future<>();
 }
 
 SEASTAR_THREAD_TEST_CASE(snapshot_test) {

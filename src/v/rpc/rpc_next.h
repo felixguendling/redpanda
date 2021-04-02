@@ -134,19 +134,6 @@ struct compat_version {
     static constexpr auto const v = V;
 };
 
-template<unsigned N>
-struct fixed_str {
-    char buf[N + 1]{};
-    constexpr fixed_str(char const* s) {
-        for (auto i = 0U; i != N; ++i) {
-            buf[i] = s[i];
-        }
-    }
-    constexpr operator char const *() const { return buf; }
-};
-template<unsigned N>
-fixed_str(char const (&)[N]) -> fixed_str<N - 1>;
-
 template<
   typename T,
   auto FieldName = "unnamed",
@@ -178,6 +165,7 @@ template<
   typename Version,
   typename CompatVersion = compat_version<Version::v>>
 struct envelope {
+    using envelope_size_t = uint32_t;
     using value_t = T;
     static constexpr auto __version = Version::v;
     static constexpr auto __compat_version = CompatVersion::v;
@@ -249,7 +237,8 @@ inline constexpr auto const is_serializable_v
 
 enum class rpc_error_codes : int {
     version_older_than_compat_version,
-    message_too_short
+    message_too_short,
+    envelope_too_big
 };
 
 struct rpc_error_category final : std::error_category {
@@ -259,6 +248,8 @@ struct rpc_error_category final : std::error_category {
         case rpc_error_codes::version_older_than_compat_version:
             return "Code message version is older than compatability version.";
         case rpc_error_codes::message_too_short:
+            return "Message length shorter than communicated message length.";
+        case rpc_error_codes::envelope_too_big:
             return "Message length shorter than communicated message length.";
         }
         return "unknown";
@@ -284,19 +275,26 @@ auto write(iobuf& out, T const& t)
         write(out, Type::__version);
         write(out, Type::__compat_version);
 
-        auto size_placeholder = out.reserve(vint::max_length);
+        auto size_placeholder = out.reserve(
+          sizeof(typename Type::envelope_size_t));
         auto const size_before = out.size_bytes();
 
         envelope_for_each_field(t, [&out](auto& f) { write(out, f); });
 
         auto const written_size = out.size_bytes() - size_before;
-        auto size_buf = std::array<uint8_t, vint::max_length>{};
-        auto const size_size = vint::serialize(written_size, &size_buf[0]);
+        if (
+          written_size
+          > std::numeric_limits<typename Type::envelope_size_t>::max()) {
+            throw std::system_error{
+              make_error_code(rpc_error_codes::envelope_too_big)};
+        }
+        auto const size = ss::cpu_to_le(
+          static_cast<typename Type::envelope_size_t>(written_size));
         size_placeholder.write(
-          reinterpret_cast<char const*>(&size_buf[0]), size_size);
+          reinterpret_cast<char const*>(&size), sizeof(size));
     } else if constexpr (std::is_scalar_v<Type>) {
         auto le_t = ss::cpu_to_le(t);
-        out.append(reinterpret_cast<const char*>(&le_t), sizeof(Type));
+        out.append(reinterpret_cast<char const*>(&le_t), sizeof(Type));
     } else if constexpr (is_std_vector_v<Type>) {
         assert(t.size() <= std::numeric_limits<uint32_t>::max());
         write(out, static_cast<uint32_t>(t.size()));
@@ -323,14 +321,8 @@ auto read(iobuf_parser& in) -> std::
         // Read envelope header: version, compat version, and size.
         auto const version = read<version_t>(in);
         auto const compat_version = read<version_t>(in);
+        auto const size = read<typename Type::envelope_size_t>(in);
         (void)version; // could be used to drop messages from old versions
-
-        auto const [size, size_size] = in.read_varlong();
-
-        // TODO(felix) this should not be necessary (wasted bytes)
-        in.consume(vint::max_length - size_size, [](const char*, size_t) {
-            return ss::stop_iteration::no;
-        });
 
         if (compat_version > Type::__version) {
             rpclog.error(
