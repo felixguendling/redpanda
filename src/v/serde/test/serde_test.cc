@@ -8,8 +8,10 @@
 // by the Apache License, Version 2.0
 
 #include "hashing/crc32c.h"
-#include "rpc/rpc_next.h"
+#include "serde/envelope.h"
+#include "serde/serde.h"
 
+#include <seastar/core/scheduling.hh>
 #include <seastar/testing/thread_test_case.hh>
 
 #include <boost/test/unit_test.hpp>
@@ -18,27 +20,28 @@
 #include <limits>
 
 struct test_msg0
-  : rpc::envelope<test_msg0, rpc::version<1>, rpc::compat_version<0>> {
+  : serde::envelope<test_msg0, serde::version<1>, serde::compat_version<0>> {
     char _i, _j;
 };
 
 struct test_msg1
-  : rpc::envelope<test_msg1, rpc::version<4>, rpc::compat_version<0>> {
+  : serde::envelope<test_msg1, serde::version<4>, serde::compat_version<0>> {
     int _a;
     test_msg0 _m;
     int _b, _c;
 };
 
 struct test_msg1_new
-  : rpc::envelope<test_msg1_new, rpc::version<10>, rpc::compat_version<5>> {
+  : serde::
+      envelope<test_msg1_new, serde::version<10>, serde::compat_version<5>> {
     int _a;
     test_msg0 _m;
     int _b, _c;
 };
 
 struct not_an_envelope {};
-static_assert(!rpc::is_envelope_v<not_an_envelope>);
-static_assert(rpc::is_envelope_v<test_msg1>);
+static_assert(!serde::is_envelope_v<not_an_envelope>);
+static_assert(serde::is_envelope_v<test_msg1>);
 static_assert(test_msg1::__version == 4);
 static_assert(test_msg1::__compat_version == 0);
 
@@ -63,15 +66,16 @@ SEASTAR_THREAD_TEST_CASE(reserve_test) {
 }
 
 SEASTAR_THREAD_TEST_CASE(simple_envelope_test) {
-    struct msg : rpc::envelope<msg, rpc::version<1>, rpc::compat_version<0>> {
+    struct msg
+      : serde::envelope<msg, serde::version<1>, serde::compat_version<0>> {
         uint32_t _i, _j;
     };
 
     auto b = iobuf();
-    rpc::write(b, msg{._i = 2, ._j = 3});
+    serde::write(b, msg{._i = 2, ._j = 3});
 
     auto parser = iobuf_parser{std::move(b)};
-    auto m = rpc::read<msg>(parser);
+    auto m = serde::read<msg>(parser);
     BOOST_CHECK(m._i == 2);
     BOOST_CHECK(m._j == 3);
 }
@@ -79,14 +83,14 @@ SEASTAR_THREAD_TEST_CASE(simple_envelope_test) {
 SEASTAR_THREAD_TEST_CASE(envelope_test) {
     auto b = iobuf();
 
-    rpc::write(
+    serde::write(
       b, test_msg1{._a = 55, ._m = {._i = 'i', ._j = 'j'}, ._b = 33, ._c = 44});
 
     std::cout << "\n\n";
     auto parser = iobuf_parser{std::move(b)};
 
     auto m = test_msg1{};
-    BOOST_CHECK_NO_THROW(m = rpc::read<test_msg1>(parser));
+    BOOST_CHECK_NO_THROW(m = serde::read<test_msg1>(parser));
     BOOST_CHECK(m._a == 55);
     BOOST_CHECK(m._b == 33);
     BOOST_CHECK(m._c == 44);
@@ -97,7 +101,7 @@ SEASTAR_THREAD_TEST_CASE(envelope_test) {
 SEASTAR_THREAD_TEST_CASE(envelope_test_version_older_than_compat_version) {
     auto b = iobuf();
 
-    rpc::write(
+    serde::write(
       b,
       test_msg1_new{
         ._a = 55, ._m = {._i = 'i', ._j = 'j'}, ._b = 33, ._c = 44});
@@ -106,12 +110,12 @@ SEASTAR_THREAD_TEST_CASE(envelope_test_version_older_than_compat_version) {
 
     auto throws = false;
     try {
-        rpc::read<test_msg1>(parser);
+        serde::read<test_msg1>(parser);
     } catch (std::system_error const& e) {
         BOOST_CHECK(
           e.code()
-          == rpc::make_error_code(
-            rpc::rpc_error_codes::version_older_than_compat_version));
+          == serde::make_error_code(
+            serde::error_codes::version_older_than_compat_version));
         throws = true;
     }
 
@@ -120,20 +124,22 @@ SEASTAR_THREAD_TEST_CASE(envelope_test_version_older_than_compat_version) {
 
 SEASTAR_THREAD_TEST_CASE(envelope_too_big_test) {
     struct big
-      : public rpc::envelope<big, rpc::version<0>, rpc::compat_version<0>> {
+      : public serde::
+          envelope<big, serde::version<0>, serde::compat_version<0>> {
         std::vector<char> data_;
     };
 
     auto too_big = std::make_unique<big>();
+    // TODO(felix) make a separate test binary with smaller envelope size type
     //    too_big->data_.resize(std::numeric_limits<big::envelope_size_t>::max());
     auto b = iobuf();
-    //    BOOST_CHECK_THROW(rpc::write(b, *too_big), std::system_error);
+    // BOOST_CHECK_THROW(serde::write(b, *too_big), std::system_error);
 }
 
 SEASTAR_THREAD_TEST_CASE(envelope_test_buffer_too_short) {
     auto b = iobuf();
 
-    rpc::write(
+    serde::write(
       b,
       test_msg1_new{
         ._a = 55, ._m = {._i = 'i', ._j = 'j'}, ._b = 33, ._c = 44});
@@ -143,7 +149,7 @@ SEASTAR_THREAD_TEST_CASE(envelope_test_buffer_too_short) {
 
     auto throws = false;
     try {
-        rpc::read<test_msg1_new>(parser);
+        serde::read<test_msg1_new>(parser);
     } catch (std::system_error const& e) {
         throws = true;
     }
@@ -153,10 +159,10 @@ SEASTAR_THREAD_TEST_CASE(envelope_test_buffer_too_short) {
 SEASTAR_THREAD_TEST_CASE(vector_test) {
     auto b = iobuf();
 
-    rpc::write(b, std::vector{1, 2, 3});
+    serde::write(b, std::vector{1, 2, 3});
 
     auto parser = iobuf_parser{std::move(b)};
-    auto const m = rpc::read<std::vector<int>>(parser);
+    auto const m = serde::read<std::vector<int>>(parser);
     BOOST_CHECK((m == std::vector{1, 2, 3}));
 }
 
@@ -164,16 +170,16 @@ SEASTAR_THREAD_TEST_CASE(vector_test) {
 // vector length may take different size (vint)
 // vector data may have different size (_ints.size() * sizeof(int))
 struct inner_differing_sizes
-  : rpc::envelope<inner_differing_sizes, rpc::version<1>> {
+  : serde::envelope<inner_differing_sizes, serde::version<1>> {
     std::vector<int32_t> _ints;
 };
 
-struct complex_msg : rpc::envelope<complex_msg, rpc::version<3>> {
+struct complex_msg : serde::envelope<complex_msg, serde::version<3>> {
     std::vector<inner_differing_sizes> _vec;
     int32_t _x;
 };
 
-static_assert(rpc::is_envelope_v<complex_msg>);
+static_assert(serde::is_envelope_v<complex_msg>);
 
 SEASTAR_THREAD_TEST_CASE(complex_msg_test) {
     auto b = iobuf();
@@ -182,7 +188,7 @@ SEASTAR_THREAD_TEST_CASE(complex_msg_test) {
     big._ints.resize(std::numeric_limits<uint16_t>::max() + 1);
     std::fill(begin(big._ints), end(big._ints), 4);
 
-    rpc::write(
+    serde::write(
       b,
       complex_msg{
         ._vec = std::
@@ -190,7 +196,7 @@ SEASTAR_THREAD_TEST_CASE(complex_msg_test) {
         ._x = 3});
 
     auto parser = iobuf_parser{std::move(b)};
-    auto const m = rpc::read<complex_msg>(parser);
+    auto const m = serde::read<complex_msg>(parser);
     BOOST_CHECK(m._vec.size() == 6);
     for (auto i = 0U; i < m._vec.size(); ++i) {
         if (i % 2 == 0) {
@@ -202,69 +208,64 @@ SEASTAR_THREAD_TEST_CASE(complex_msg_test) {
 }
 
 struct test_snapshot_header
-  : rpc::
-      envelope<test_snapshot_header, rpc::version<1>, rpc::compat_version<0>> {
+  : serde::envelope<
+      test_snapshot_header,
+      serde::version<1>,
+      serde::compat_version<0>> {
+    ss::future<> serde_async_read(iobuf_parser&);
+    ss::future<> serde_async_write(iobuf&) const;
+
     uint32_t header_crc;
     uint32_t metadata_crc;
     int8_t version;
     int32_t metadata_size;
 };
 
-static_assert(rpc::is_envelope_v<test_snapshot_header>);
+static_assert(serde::is_envelope_v<test_snapshot_header>);
+static_assert(serde::has_serde_async_read<test_snapshot_header>);
+static_assert(serde::has_serde_async_write<test_snapshot_header>);
 
-template<
-  typename T,
-  rpc::mode M,
-  std::enable_if_t<
-    M == rpc::mode::ASYNC
-      && std::is_same_v<test_snapshot_header, std::decay_t<T>>,
-    void*> = nullptr>
-auto read(iobuf_parser& in) -> ss::future<std::decay_t<test_snapshot_header>> {
-    test_snapshot_header hdr;
-    hdr.header_crc = rpc::read<decltype(hdr.header_crc)>(in);
-    hdr.metadata_crc = rpc::read<decltype(hdr.metadata_crc)>(in);
-    hdr.version = rpc::read<decltype(hdr.version)>(in);
-    hdr.metadata_size = rpc::read<decltype(hdr.metadata_size)>(in);
+ss::future<> test_snapshot_header::serde_async_read(iobuf_parser& in) {
+    header_crc = serde::read<decltype(header_crc)>(in);
+    metadata_crc = serde::read<decltype(metadata_crc)>(in);
+    version = serde::read<decltype(version)>(in);
+    metadata_size = serde::read<decltype(metadata_size)>(in);
 
-    vassert(
-      hdr.metadata_size >= 0, "Invalid metadata size {}", hdr.metadata_size);
+    vassert(metadata_size >= 0, "Invalid metadata size {}", metadata_size);
 
     crc32 crc;
-    crc.extend(ss::cpu_to_le(hdr.metadata_crc));
-    crc.extend(ss::cpu_to_le(hdr.version));
-    crc.extend(ss::cpu_to_le(hdr.metadata_size));
+    crc.extend(ss::cpu_to_le(metadata_crc));
+    crc.extend(ss::cpu_to_le(version));
+    crc.extend(ss::cpu_to_le(metadata_size));
 
-    if (hdr.header_crc != crc.value()) {
-        return ss::make_exception_future<test_snapshot_header>(
-          std::runtime_error(fmt::format(
-            "Corrupt snapshot. Failed to verify header crc: {} != "
-            "{}: path?",
-            crc.value(),
-            hdr.header_crc)));
+    if (header_crc != crc.value()) {
+        return ss::make_exception_future<>(std::runtime_error(fmt::format(
+          "Corrupt snapshot. Failed to verify header crc: {} != "
+          "{}: path?",
+          crc.value(),
+          header_crc)));
     }
 
-    return ss::make_ready_future<test_snapshot_header>(hdr);
+    return ss::make_ready_future<>();
 }
 
-template<
-  rpc::mode M = rpc::mode::ASYNC,
-  typename T,
-  std::enable_if_t<M == rpc::mode::ASYNC, void*> = nullptr>
-ss::future<> write(iobuf& out, test_snapshot_header const& t) {
-    rpc::write(out, t.header_crc);
-    rpc::write(out, t.metadata_crc);
-    rpc::write(out, t.version);
-    rpc::write(out, t.metadata_size);
+ss::future<> test_snapshot_header::serde_async_write(iobuf& out) const {
+    serde::write(out, header_crc);
+    serde::write(out, metadata_crc);
+    serde::write(out, version);
+    serde::write(out, metadata_size);
     return ss::make_ready_future<>();
 }
 
 SEASTAR_THREAD_TEST_CASE(snapshot_test) {
     auto b = iobuf();
-    rpc::write(
+    auto const write_future = serde::write_async(
       b,
       test_snapshot_header{
         .header_crc = 1, .metadata_crc = 2, .version = 3, .metadata_size = 4});
     auto parser = iobuf_parser{std::move(b)};
-    auto const f = read<test_snapshot_header, rpc::mode::ASYNC>(parser);
-    BOOST_CHECK(f.failed());
+    auto read_future = serde::read_async<test_snapshot_header>(parser);
+    read_future.wait();
+    BOOST_CHECK(read_future.failed());
+    BOOST_CHECK(read_future.get_exception());
 }

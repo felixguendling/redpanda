@@ -26,6 +26,7 @@ add_subdirectory(http)
 add_subdirectory(s3)
 add_subdirectory(archival)
 add_subdirectory(security)
+add_subdirectory(serde)
 
 include(GetGitRevisionDescription)
 get_git_head_revision(GIT_REFSPEC GIT_SHA1)
