@@ -14,9 +14,9 @@
 namespace serde {
 
 #if defined(_MSC_VER)
-#define CISTA_SIG __FUNCSIG__
+#define SERDE_SIG __FUNCSIG__
 #elif defined(__clang__) || defined(__GNUC__)
-#define CISTA_SIG __PRETTY_FUNCTION__
+#define SERDE_SIG __PRETTY_FUNCTION__
 #else
 #error unsupported compiler
 #endif
@@ -39,7 +39,7 @@ constexpr std::string_view type_str() {
       = "; std::string_view = std::basic_string_view<char>]";
 #endif
 
-    auto sig = std::string_view{CISTA_SIG};
+    auto sig = std::string_view{SERDE_SIG};
     sig.remove_prefix(prefix.size());
     sig.remove_suffix(suffix.size());
     return sig;
