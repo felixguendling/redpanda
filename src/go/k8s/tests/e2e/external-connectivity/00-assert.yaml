@@ -29,13 +29,14 @@ spec:
             - redpanda
             - start
             - --check=false
-            - --smp 1
-            - --reserve-memory 1M
             - --advertise-rpc-addr=$(POD_NAME).external-connectivity.$(POD_NAMESPACE).svc.cluster.local.:33145
-            - --
+            - --overprovisioned
+            - --reserve-memory 1M
+            - --smp=1
+            - --kernel-page-cache=true
             - --default-log-level=debug
 status:
-  readyReplicas: 3
+  readyReplicas: 1
 ---
 apiVersion: v1
 kind: Service
@@ -44,14 +45,14 @@ metadata:
 spec:
   clusterIP: None
   ports:
-    - name: kafka
-      port: 9092
-      protocol: TCP
-      targetPort: 9092
     - name: admin
       port: 9644
       protocol: TCP
       targetPort: 9644
+    - name: kafka
+      port: 9092
+      protocol: TCP
+      targetPort: 9092
   type: ClusterIP
 ---
 apiVersion: v1
@@ -60,14 +61,8 @@ metadata:
   name: external-connectivity-external
 spec:
   ports:
-    - name: admin
-      port: 9644
-      protocol: TCP
-      targetPort: 9644
-      nodePort: 30964
-    - name: kafka
-      port: 9093
-      protocol: TCP
-      targetPort: 9093
-      nodePort: 30950
+  - name: kafka-external
+    port: 9093
+    protocol: TCP
+    targetPort: 9093
   type: NodePort

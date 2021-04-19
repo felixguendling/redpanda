@@ -16,6 +16,7 @@ import (
 
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/afero"
+	"github.com/spf13/pflag"
 	"github.com/stretchr/testify/require"
 	"github.com/vectorizedio/redpanda/src/go/rpk/pkg/config"
 	"github.com/vectorizedio/redpanda/src/go/rpk/pkg/redpanda"
@@ -927,6 +928,58 @@ func TestStartCommand(t *testing.T) {
 			)
 		},
 	}, {
+		name: "it should parse the --advertise-pandaproxy-addr and persist it",
+		args: []string{
+			"--install-dir", "/var/lib/redpanda",
+			"--advertise-pandaproxy-addr", "192.168.34.32:8083",
+		},
+		postCheck: func(fs afero.Fs, _ *rp.RedpandaArgs, st *testing.T) {
+			mgr := config.NewManager(fs)
+			conf, err := mgr.Read(config.Default().ConfigFile)
+			require.NoError(st, err)
+			expectedAddr := []config.NamedSocketAddress{{
+				SocketAddress: config.SocketAddress{
+					Address: "192.168.34.32",
+					Port:    8083,
+				},
+			}}
+			// Check that the generated config is as expected.
+			require.Exactly(
+				st,
+				expectedAddr,
+				conf.Pandaproxy.AdvertisedPandaproxyAPI,
+			)
+		},
+	}, {
+		name: "if --advertise-pandaproxy-addr, it should fall back to REDPANDA_ADVERTISE_PANDAPROXY_ADDRESS and persist it",
+		args: []string{
+			"--install-dir", "/var/lib/redpanda",
+		},
+		before: func(_ afero.Fs) error {
+			os.Setenv("REDPANDA_ADVERTISE_PANDAPROXY_ADDRESS", "host:3123")
+			return nil
+		},
+		after: func() {
+			os.Unsetenv("REDPANDA_ADVERTISE_PANDAPROXY_ADDRESS")
+		},
+		postCheck: func(fs afero.Fs, _ *rp.RedpandaArgs, st *testing.T) {
+			mgr := config.NewManager(fs)
+			conf, err := mgr.Read(config.Default().ConfigFile)
+			require.NoError(st, err)
+			expectedAddr := []config.NamedSocketAddress{{
+				SocketAddress: config.SocketAddress{
+					Address: "host",
+					Port:    3123,
+				},
+			}}
+			// Check that the generated config is as expected.
+			require.Exactly(
+				st,
+				expectedAddr,
+				conf.Pandaproxy.AdvertisedPandaproxyAPI,
+			)
+		},
+	}, {
 		name: "it should parse the --advertise-rpc-addr and persist it",
 		args: []string{
 			"--install-dir", "/var/lib/redpanda",
@@ -1100,6 +1153,31 @@ func TestStartCommand(t *testing.T) {
 		) {
 			require.Equal(st, "4G", rpArgs.SeastarFlags["memory"])
 		},
+	}, {
+		name: "it should allow arbitrary flags",
+		args: []string{
+			"--install-dir", "/var/lib/redpanda",
+			"--this-flag-is-definitely-not-known", "right",
+			"--kernel-page-cache", "1",
+			"--another-arbitrary-seastar-flag", "",
+		},
+	}, {
+		name: "it should allow arbitrary flags after '--'",
+		args: []string{
+			"--install-dir", "/var/lib/redpanda",
+			"--",
+			"--i-just-made-this-on-the-spot", "nice",
+		},
+		postCheck: func(
+			_ afero.Fs,
+			rpArgs *rp.RedpandaArgs,
+			st *testing.T,
+		) {
+			expected := []string{
+				"--i-just-made-this-on-the-spot", "nice",
+			}
+			require.Equal(st, expected, rpArgs.ExtraArgs)
+		},
 	}}
 
 	for _, tt := range tests {
@@ -1130,6 +1208,56 @@ func TestStartCommand(t *testing.T) {
 				l := launcher.(*noopLauncher)
 				tt.postCheck(fs, l.rpArgs, st)
 			}
+		})
+	}
+}
+
+func TestExtraFlags(t *testing.T) {
+	tests := []struct {
+		name     string
+		flagSet  func() *pflag.FlagSet
+		args     []string
+		expected map[string]string
+	}{{
+		name: "it should only return unknown flags",
+		flagSet: func() *pflag.FlagSet {
+			fset := pflag.NewFlagSet("test", 0)
+			_ = fset.Int("int-flag", 0, "usage")
+			_ = fset.String("str-flag", "default value", "usage")
+			_ = fset.BoolP("bool-flag", "b", true, "usage")
+			return fset
+		},
+		args: []string{
+			"--int-flag", "23",
+			"--str-flag", "hello",
+			"--bool-flag", "false",
+			"--kernel-page-cache", "1",
+			"--another-arbitrary-seastar-flag", "",
+		},
+		expected: map[string]string{
+			"kernel-page-cache":              "1",
+			"another-arbitrary-seastar-flag": "",
+		},
+	}, {
+		name: "it should return an empty map if there are no unknown flags",
+		flagSet: func() *pflag.FlagSet {
+			fset := pflag.NewFlagSet("test", 0)
+			_ = fset.Int("int-flag", 0, "usage")
+			_ = fset.String("str-flag", "default value", "usage")
+			_ = fset.BoolP("bool-flag", "b", true, "usage")
+			return fset
+		},
+		args: []string{
+			"--int-flag", "23",
+			"--str-flag", "hello",
+		},
+		expected: map[string]string{},
+	}}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(st *testing.T) {
+			result := extraFlags(tt.flagSet(), tt.args)
+			require.Exactly(st, tt.expected, result)
 		})
 	}
 }

@@ -16,6 +16,7 @@
 #include "s3/error.h"
 #include "s3/logger.h"
 #include "s3/signature.h"
+#include "ssx/sformat.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/coroutine.hh>
@@ -29,7 +30,6 @@
 #include <boost/beast/core/error.hpp>
 #include <boost/property_tree/ptree.hpp>
 #include <boost/property_tree/xml_parser.hpp>
-#include <fmt/core.h>
 #include <gnutls/crypto.h>
 
 #include <exception>
@@ -59,7 +59,7 @@ static ss::sstring make_endpoint_url(
     if (url_override) {
         return url_override.value();
     }
-    return fmt::format("s3.{}.amazonaws.com", region());
+    return ssx::sformat("s3.{}.amazonaws.com", region());
 }
 
 ss::future<configuration> configuration::make_configuration(
@@ -94,11 +94,9 @@ ss::future<configuration> configuration::make_configuration(
         client_cfg.credentials
           = co_await cred_builder.build_reloadable_certificate_credentials();
     }
-    auto addr = co_await ss::net::dns::resolve_name(
-      client_cfg.uri(), ss::net::inet_address::family::INET);
     constexpr uint16_t default_port = 443;
-    client_cfg.server_addr = ss::socket_address(
-      addr, overrides.port ? *overrides.port : default_port);
+    client_cfg.server_addr = unresolved_address(
+      client_cfg.uri(), overrides.port ? *overrides.port : default_port);
     co_return client_cfg;
 }
 

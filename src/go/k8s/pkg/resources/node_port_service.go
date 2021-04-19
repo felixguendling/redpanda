@@ -33,7 +33,7 @@ type NodePortServiceResource struct {
 	k8sclient.Client
 	scheme       *runtime.Scheme
 	pandaCluster *redpandav1alpha1.Cluster
-	svcPorts     map[string]int
+	svcPorts     []NamedServicePort
 	logger       logr.Logger
 }
 
@@ -42,7 +42,7 @@ func NewNodePortService(
 	client k8sclient.Client,
 	pandaCluster *redpandav1alpha1.Cluster,
 	scheme *runtime.Scheme,
-	svcPorts map[string]int,
+	svcPorts []NamedServicePort,
 	logger logr.Logger,
 ) *NodePortServiceResource {
 	return &NodePortServiceResource{
@@ -56,7 +56,7 @@ func NewNodePortService(
 
 // Ensure will manage kubernetes v1.Service for redpanda.vectorized.io custom resource
 func (r *NodePortServiceResource) Ensure(ctx context.Context) error {
-	if !r.pandaCluster.Spec.ExternalConnectivity.Enabled {
+	if r.pandaCluster.ExternalListener() == nil {
 		return nil
 	}
 
@@ -64,23 +64,27 @@ func (r *NodePortServiceResource) Ensure(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("unable to construct object: %w", err)
 	}
-
-	_, err = CreateIfNotExists(ctx, r, obj, r.logger)
-	return err
+	created, err := CreateIfNotExists(ctx, r, obj, r.logger)
+	if err != nil || created {
+		return err
+	}
+	var svc corev1.Service
+	err = r.Get(ctx, r.Key(), &svc)
+	if err != nil {
+		return fmt.Errorf("error while fetching Service resource: %w", err)
+	}
+	return Update(ctx, &svc, obj, r.Client, r.logger)
 }
 
 // obj returns resource managed client.Object
 func (r *NodePortServiceResource) obj() (k8sclient.Object, error) {
 	ports := make([]corev1.ServicePort, 0, len(r.svcPorts))
-	for name, portNumber := range r.svcPorts {
-		if name == "kafka" {
-			portNumber++
-		}
+	for _, svcPort := range r.svcPorts {
 		ports = append(ports, corev1.ServicePort{
-			Name:       name,
+			Name:       svcPort.Name,
 			Protocol:   corev1.ProtocolTCP,
-			Port:       int32(portNumber),
-			TargetPort: intstr.FromInt(portNumber),
+			Port:       int32(svcPort.Port),
+			TargetPort: intstr.FromInt(svcPort.Port),
 		})
 	}
 
@@ -121,14 +125,6 @@ func (r *NodePortServiceResource) obj() (k8sclient.Object, error) {
 	}
 
 	return svc, nil
-}
-
-// CalculateExternalPort can calculate external Kafka API port based on the internal Kafka API port
-func CalculateExternalPort(kafkaInternalPort int) int {
-	if kafkaInternalPort < 0 || kafkaInternalPort > 65535 {
-		return 0
-	}
-	return kafkaInternalPort + 1
 }
 
 // Key returns namespace/name object that is used to identify object.

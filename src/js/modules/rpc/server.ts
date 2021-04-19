@@ -30,6 +30,7 @@ import { Handle } from "../domain/Handle";
 import errors, { DisableResponseCode } from "./errors";
 import { Logger } from "winston";
 import Logging from "../utilities/Logging";
+import requireNative from "./require-native";
 
 export class ProcessBatchServer extends SupervisorServer {
   private readonly repository: Repository;
@@ -158,12 +159,14 @@ export class ProcessBatchServer extends SupervisorServer {
      * We create a 'module' result where our function save the object that
      * coprocessor script exports.
      */
-    const module: ResultFunction = {};
+    const module: ResultFunction = {
+      exports: {},
+    };
     /**
      * pass our module object and nodeJs require function.
      */
     try {
-      loadScript(module, require);
+      loadScript(module, requireNative);
     } catch (e) {
       this.logger.error(`error on load wasm script: ${id}, ${e.message}`);
       return [undefined, errors.validateLoadScriptError(e, id, script)];
@@ -196,17 +199,13 @@ export class ProcessBatchServer extends SupervisorServer {
       this.fireException
     );
 
-    return Promise.allSettled(results).then((coprocessorResults) => {
-      const array: ProcessBatchReplyItem[][] = [];
-      coprocessorResults.forEach((result) => {
-        if (result.status === "rejected") {
-          console.error(result.reason);
-        } else {
-          array.push(result.value);
-        }
-      });
-      return array.flat();
-    });
+    return Promise.all(results).then(
+      (coprocessorResults) => coprocessorResults.flat(),
+      (e) => {
+        this.logger.error(e);
+        return Logging.close().then(() => process.exit(1));
+      }
+    );
   }
 
   /**

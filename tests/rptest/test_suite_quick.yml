@@ -15,10 +15,11 @@ quick:
   - tests/librdkafka_test.py
   - tests/rpk_test.py
   - tests/demo_test.py
-  - tests/configuration_update_test.py
   - tests/compacted_term_rolled_recovery_test.py
   - tests/compacted_topic_verifier_test.py
   - tests/compaction_recovery_test.py
-  - tests/partition_movement_test.py::PartitionMovementTest.test_cycle_simple
-  - tests/wasm_identity_test.py
   - tests/pandaproxy_test.py::PandaProxyTest.test_consumer_group
+  - tests/pandaproxy_test.py::PandaProxyTest.test_subscribe_consumer_validation
+  - tests/pandaproxy_test.py::PandaProxyTest.test_remove_consumer_validation
+  - tests/wasm_failure_recovery_test.py
+  - tests/wasm_redpanda_failure_recovery_test.py

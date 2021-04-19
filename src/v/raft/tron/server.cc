@@ -171,7 +171,10 @@ extract_peer(ss::sstring peer) {
     }
     int32_t n = boost::lexical_cast<int32_t>(parts[0]);
     rpc::transport_configuration cfg;
-    cfg.server_addr = ss::ipv4_addr(parts[1]);
+    std::vector<ss::sstring> address_parts;
+    boost::split(parts, parts[1], boost::is_any_of(":"));
+    cfg.server_addr = unresolved_address(
+      address_parts[0], boost::lexical_cast<int16_t>(address_parts[1]));
     return {model::node_id(n), cfg};
 }
 
@@ -288,7 +291,7 @@ int main(int args, char** argv, char** env) {
                   connection_cache,
                   cfg["peers"].as<std::vector<ss::sstring>>());
             }
-            const ss::sstring workdir = fmt::format(
+            const ss::sstring workdir = ssx::sformat(
               "{}/greetings-{}",
               cfg["workdir"].as<ss::sstring>(),
               cfg["node-id"].as<int32_t>());

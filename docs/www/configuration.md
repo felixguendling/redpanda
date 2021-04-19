@@ -112,20 +112,26 @@ redpanda:
     name: external
     port: 9093
 
-  # TLS configuration for the Kafka API.
+  # A list of TLS configurations for the Kafka API listeners.
   # Default: null
   kafka_api_tls:
+    # The name of the specific listener this TLS to which this config
+    # will be applied. The names must match those in kafka_api.
+  - name: "external"
     # Whether to enable TLS for the Kafka API.
-    enabled: false
+    enabled: true
     # Require client authentication
     require_client_auth: false
     # The path to the server certificate PEM file.
-    cert_file: ""
+    cert_file: "certs/tls-cert.pem"
     # The path to the server key PEM file
-    key_file: ""
+    key_file: "certs/tls-key.pem"
     # The path to the truststore PEM file. Only required if client authentication
     # is enabled.
-    truststore_file: ""
+    truststore_file: "certs/tls-ca.pem"
+
+  - name: "internal"
+    enabled: false
 
   # Multiple listeners are also supported as per KIP-103.
   # The names must match those in kafka_api
@@ -137,11 +143,11 @@ redpanda:
     name: external
     port: 9093
   
-  # List of the seed servers used to join current cluster. If the seed_server list is
-  # empty the node will be a cluster root and it will form a new cluster
+  # List of the seed server IP addresses and ports used to join current cluster.
+  # If the seed_server list is empty the node will be a cluster root and it will form a new cluster.
   # Default: []
   seed_servers:
-    - address: "192.167.32.78"
+    - address: "0.0.0.0"
       port: 33145
   
   # Number of partitions for the internal raft metadata topic.
@@ -338,7 +344,7 @@ redpanda:
 # This top-level config node enables the REST Proxy
 pandaproxy:
   # IP and port to listen for Kafka REST API requests.
-  # Default: 127.0.0.1:8082
+  # Default: 0.0.0.0:8082
   pandaproxy_api: 
     address: "0.0.0.0"
     port: 8082
@@ -406,6 +412,14 @@ pandaproxy_client:
   # Default: 100ms
   produce_batch_delay_ms: 100
 
+  # Interval (in milliseconds) for consumer request timeout
+  # Default: 100ms
+  consumer_request_timeout_ms: 100
+
+  # Max bytes to fetch per request
+  # Default: 1MiB
+  consumer_request_max_bytes: 1048576
+      
   # Timeout (in milliseconds) for consumer session
   # Default: 10s
   consumer_session_timeout_ms: 10000

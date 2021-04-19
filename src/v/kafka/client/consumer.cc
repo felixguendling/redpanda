@@ -30,6 +30,7 @@
 #include "model/record_utils.h"
 
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/gate.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/core/sleep.hh>
 
@@ -66,7 +67,7 @@ struct partition_comp {
     bool operator()(
       const metadata_response::partition& lhs,
       const metadata_response::partition& rhs) const {
-        return lhs.index < rhs.index;
+        return lhs.partition_index < rhs.partition_index;
     }
 };
 
@@ -87,9 +88,13 @@ void consumer::start() {
     kclog.info("Consumer: {}: start", *this);
     _timer.set_callback([me{shared_from_this()}]() {
         kclog.trace("Consumer: {}: timer cb", *me);
-        (void)me->heartbeat().handle_exception_type([me](consumer_error e) {
-            kclog.error("Consumer: {}: heartbeat failed: {}", *me, e.error);
-        });
+        (void)me->heartbeat()
+          .handle_exception_type([me](const consumer_error& e) {
+              kclog.error("Consumer: {}: heartbeat failed: {}", *me, e.error);
+          })
+          .handle_exception_type([me](const ss::gate_closed_exception& e) {
+              kclog.trace("Consumer: {}: heartbeat failed: {}", *me, e);
+          });
     });
     _timer.rearm_periodic(std::chrono::duration_cast<ss::timer<>::duration>(
       _config.consumer_heartbeat_interval()));
@@ -108,7 +113,7 @@ ss::future<> consumer::join() {
     auto req_builder = [me{shared_from_this()}]() {
         const auto& cfg = me->_config;
         join_group_request req{};
-        req.client_id = "test_client";
+        req.client_id = kafka::client_id("test_client");
         req.data = {
           .group_id = me->_group_id,
           .session_timeout_ms = cfg.consumer_session_timeout(),
@@ -210,12 +215,15 @@ consumer::get_subscribed_topic_metadata() {
       .then([this](metadata_response res) {
           std::vector<sync_group_request_assignment> assignments;
 
-          std::sort(res.topics.begin(), res.topics.end(), detail::topic_comp{});
+          std::sort(
+            res.data.topics.begin(),
+            res.data.topics.end(),
+            detail::topic_comp{});
           std::vector<metadata_response::topic> topics;
           topics.reserve(_subscribed_topics.size());
           std::set_intersection(
-            res.topics.begin(),
-            res.topics.end(),
+            res.data.topics.begin(),
+            res.data.topics.end(),
             _subscribed_topics.begin(),
             _subscribed_topics.end(),
             std::back_inserter(topics),
@@ -334,7 +342,8 @@ consumer::offset_commit(std::vector<offset_commit_request_topic> topics) {
         for (auto& t : topics) {
             for (auto& p : t.partitions) {
                 auto tp = model::topic_partition{t.name, p.partition_index};
-                auto broker = co_await _brokers.find(tp);
+                auto leader = co_await _topic_cache.leader(tp);
+                auto broker = co_await _brokers.find(leader);
                 p.committed_leader_epoch = _fetch_sessions[broker].epoch();
             }
         }
@@ -365,14 +374,15 @@ consumer::dispatch_fetch(broker_reqs_t::value_type br) {
     co_return res;
 }
 
-ss::future<fetch_response>
-consumer::fetch(std::chrono::milliseconds timeout, int32_t max_bytes) {
+ss::future<fetch_response> consumer::fetch(
+  std::chrono::milliseconds timeout, std::optional<int32_t> max_bytes) {
     // Split requests by broker
     broker_reqs_t broker_reqs;
     for (auto const& [t, ps] : _assignment) {
         for (const auto& p : ps) {
             auto tp = model::topic_partition{t, p};
-            auto broker = co_await _brokers.find(tp);
+            auto leader = co_await _topic_cache.leader(tp);
+            auto broker = co_await _brokers.find(leader);
             auto& session = _fetch_sessions[broker];
 
             auto& req = broker_reqs
@@ -382,7 +392,8 @@ consumer::fetch(std::chrono::milliseconds timeout, int32_t max_bytes) {
                               .replica_id = consumer_replica_id,
                               .max_wait_time = timeout,
                               .min_bytes = 1,
-                              .max_bytes = max_bytes,
+                              .max_bytes = max_bytes.value_or(
+                                _config.consumer_request_max_bytes),
                               .isolation_level = 0, // READ_UNCOMMITTED
                               .session_id = session.id(),
                               .session_epoch = session.epoch(),
@@ -396,7 +407,8 @@ consumer::fetch(std::chrono::milliseconds timeout, int32_t max_bytes) {
             req.topics.back().partitions.push_back(fetch_request::partition{
               .id = p,
               .fetch_offset = session.offset(tp),
-              .partition_max_bytes = max_bytes});
+              .partition_max_bytes = max_bytes.value_or(
+                _config.consumer_request_max_bytes)});
         }
     }
 
@@ -415,11 +427,18 @@ consumer::fetch(std::chrono::milliseconds timeout, int32_t max_bytes) {
 
 ss::future<shared_consumer_t> make_consumer(
   const configuration& config,
+  topic_cache& topic_cache,
   brokers& brokers,
   shared_broker_t coordinator,
-  group_id group_id) {
+  group_id group_id,
+  member_id name) {
     auto c = ss::make_lw_shared<consumer>(
-      config, brokers, std::move(coordinator), std::move(group_id));
+      config,
+      topic_cache,
+      brokers,
+      std::move(coordinator),
+      std::move(group_id),
+      std::move(name));
     return c->join().then([c]() mutable { return std::move(c); });
 }
 

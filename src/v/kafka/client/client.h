@@ -19,7 +19,9 @@
 #include "kafka/client/fetcher.h"
 #include "kafka/client/producer.h"
 #include "kafka/client/retry_with_mitigation.h"
+#include "kafka/client/topic_cache.h"
 #include "kafka/client/transport.h"
+#include "kafka/client/types.h"
 #include "kafka/protocol/fetch.h"
 #include "kafka/types.h"
 #include "utils/retry.h"
@@ -30,6 +32,7 @@
 
 #include <absl/container/flat_hash_map.h>
 #include <absl/container/flat_hash_set.h>
+#include <absl/container/node_hash_map.h>
 
 namespace kafka::client {
 
@@ -66,12 +69,12 @@ public:
     /// \brief Connect to all brokers.
     ss::future<> connect();
     /// \brief Disconnect from all brokers.
-    ss::future<> stop();
+    ss::future<> stop() noexcept;
 
     /// \brief Invoke func, on failure, mitigate error and retry.
     template<typename Func>
     std::invoke_result_t<Func> gated_retry_with_mitigation(Func func) {
-        return ss::with_gate(_gate, [this, func{std::move(func)}]() {
+        return ss::try_with_gate(_gate, [this, func{std::move(func)}]() {
             return retry_with_mitigation(
               _config.retries(),
               _config.retry_base_backoff(),
@@ -101,13 +104,17 @@ public:
     ss::future<produce_response::partition> produce_record_batch(
       model::topic_partition tp, model::record_batch&& batch);
 
+    ss::future<produce_response>
+    produce_records(model::topic topic, std::vector<record_essence> batch);
+
     ss::future<fetch_response> fetch_partition(
       model::topic_partition tp,
       model::offset offset,
       int32_t max_bytes,
       std::chrono::milliseconds timeout);
 
-    ss::future<member_id> create_consumer(const group_id& g_id);
+    ss::future<member_id>
+    create_consumer(const group_id& g_id, member_id name = kafka::no_member);
 
     ss::future<> remove_consumer(const group_id& g_id, const member_id& m_id);
 
@@ -135,8 +142,8 @@ public:
     ss::future<fetch_response> consumer_fetch(
       const group_id& g_id,
       const member_id& m_id,
-      std::chrono::milliseconds timeout,
-      int32_t max_bytes);
+      std::optional<std::chrono::milliseconds> timeout,
+      std::optional<int32_t> max_bytes);
 
     ss::future<> update_metadata() { return _wait_or_start_update_metadata(); }
 
@@ -165,10 +172,15 @@ private:
     ss::future<shared_consumer_t>
     get_consumer(const group_id& g_id, const member_id& m_id);
 
+    /// \brief Apply metadata update
+    ss::future<> apply(metadata_response res);
+
     /// \brief Client holds a copy of its configuration
     configuration _config;
     /// \brief Seeds are used when no brokers are connected.
     std::vector<unresolved_address> _seeds;
+    /// \brief Cache of topic information.
+    topic_cache _topic_cache;
     /// \brief Broker lookup from topic_partition.
     brokers _brokers;
     /// \brief Update metadata, or wait for an existing one.
@@ -176,10 +188,12 @@ private:
     /// \brief Batching producer.
     producer _producer;
     /// \brief Consumers
-    absl::flat_hash_set<
-      shared_consumer_t,
-      detail::consumer_hash,
-      detail::consumer_eq>
+    absl::node_hash_map<
+      kafka::group_id,
+      absl::flat_hash_set<
+        shared_consumer_t,
+        detail::consumer_hash,
+        detail::consumer_eq>>
       _consumers;
     /// \brief Wait for retries.
     ss::gate _gate;

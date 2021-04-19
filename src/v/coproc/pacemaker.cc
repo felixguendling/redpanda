@@ -34,7 +34,7 @@
 namespace coproc {
 
 rpc::transport_configuration
-wasm_transport_cfg(const ss::socket_address& addr) {
+wasm_transport_cfg(const unresolved_address& addr) {
     return rpc::transport_configuration{
       .server_addr = addr,
       .max_queued_bytes = static_cast<uint32_t>(
@@ -49,13 +49,11 @@ rpc::backoff_policy wasm_transport_backoff() {
     return rpc::make_exponential_backoff_policy<rpc::clock_type>(1s, 10s);
 }
 
-pacemaker::pacemaker(ss::socket_address addr, ss::sharded<storage::api>& api)
+pacemaker::pacemaker(unresolved_address addr, ss::sharded<storage::api>& api)
   : _shared_res(
     rpc::reconnect_transport(
       wasm_transport_cfg(addr), wasm_transport_backoff()),
-    api.local()) {}
-
-ss::future<> pacemaker::start() {
+    api.local()) {
     _offs.timer.set_callback([this] {
         (void)ss::with_gate(_gate, [this] {
             return save_offsets(_offs.snap, _ntps).then([this] {
@@ -65,10 +63,22 @@ ss::future<> pacemaker::start() {
             });
         });
     });
+}
+
+ss::future<> pacemaker::start() {
     co_await ss::recursive_touch_directory(offsets_snapshot_path().string());
     auto ncc = co_await recover_offsets(_offs.snap, _shared_res.api.log_mgr());
     _ntps = std::move(ncc);
-    _offs.timer.arm(_offs.duration);
+    if (!_offs.timer.armed()) {
+        _offs.timer.arm(_offs.duration);
+    }
+}
+
+ss::future<> pacemaker::reset() {
+    _offs.timer.cancel();
+    auto removed = co_await remove_all_sources();
+    vlog(coproclog.info, "Pacemaker reset {} scripts", removed.size());
+    co_await start();
 }
 
 ss::future<> pacemaker::stop() {
@@ -181,10 +191,12 @@ void pacemaker::do_add_source(
                 ntp_ctx = ss::make_lw_shared<ntp_context>(log);
                 _ntps.emplace(ntp, ntp_ctx);
             }
-            vassert(
-              ntp_ctx->offsets.emplace(id, ntp_context::offset_pair()).second,
-              "Script id expected to not exist: {}",
-              id);
+            auto success
+              = ntp_ctx->offsets.emplace(id, ntp_context::offset_pair()).second;
+            if (!success) {
+                vlog(
+                  coproclog.info, "Script with id {} has been recovered", id);
+            }
             ctxs.emplace(ntp, ntp_ctx);
         }
         acks.push_back(errc::success);

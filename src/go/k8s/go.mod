@@ -3,7 +3,6 @@ module github.com/vectorizedio/redpanda/src/go/k8s
 go 1.15
 
 require (
-	github.com/Shopify/sarama v1.28.1-0.20210318150015-41df78df10a9
 	github.com/banzaicloud/k8s-objectmatcher v1.5.1
 	github.com/go-logr/logr v0.3.0
 	github.com/hashicorp/go-multierror v1.1.0
@@ -11,6 +10,7 @@ require (
 	github.com/mitchellh/mapstructure v1.4.1
 	github.com/onsi/ginkgo v1.14.1
 	github.com/onsi/gomega v1.10.2
+	github.com/prometheus/client_golang v1.10.0
 	github.com/spf13/afero v1.2.2
 	github.com/stretchr/testify v1.7.0
 	github.com/vectorizedio/redpanda/src/go/rpk v0.0.0-00010101000000-000000000000

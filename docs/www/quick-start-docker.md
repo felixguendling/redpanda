@@ -11,7 +11,34 @@ and be fully compatible with the [Kafka ecosystem](https://cwiki.apache.org/conf
 This quick start guide can help you get started with Redpanda for development and testing purposes.
 For production or benchmarking, setup a [production deployment](/docs/production-deployment).
 
-## Set up network and persistent volumes
+## Get your cluster ready
+
+To get a cluster ready for streaming, either run a single docker container with Redpanda running or a cluster of 3 containers.
+
+> **_Note:_** You can also use [`rpk container`](/docs/guide-rpk-container) to run Redpanda in containers
+    without having to interact with Docker at all.
+
+### Single command for a 1-node cluster
+
+With a 1-node cluster you can test out a simple implementation of Redpanda.
+
+```bash
+# --overprovisioned is used to accomodate docker resource limitations
+# make sure you update the version of v21.4.6 to the latest release https://github.com/vectorizedio/redpanda/releases
+
+
+docker run -ti --rm -p 8082:8082 -p 9092:9092 vectorized/redpanda:v21.4.6 start --overprovisioned --smp 1  --memory 1G  --reserve-memory 0M --node-id 0 --check=false
+
+```
+
+You can do some [simple topic actions](#Do-some-streaming) to do some streaming.
+Otherwise, just point your [Kafka-compatible client](/docs/faq/#What-clients-do-you-recommend-to-use-with-Redpanda) to 127.0.0.1:9092.
+
+### Set up a 3-node cluster
+
+To test out the interaction between nodes in a cluster, set up a Docker network with 3 containers in a cluster.
+
+#### Create network and persistent volumes
 
 First we need to set up a bridge network so that the Redpanda instances can communicate with each other
 but still allow for the Kafka API to be available on the localhost.
@@ -24,18 +51,16 @@ docker volume create redpanda2 && \
 docker volume create redpanda3
 ```
 
-## Start Redpanda nodes
+#### Start Redpanda nodes
 
 We then need to start the nodes for the Redpanda cluster.
-
-> **_Note:_** To get the latest Redpanda image,
-> make sure you delete any `vectorized/redpanda:latest` images that you downloaded before. 
 
 ```bash
 docker run -d \
 --name=redpanda-1 \
 --hostname=redpanda-1 \
 --net=redpandanet \
+-p 8082:8082 \
 -p 9092:9092 \
 -v "redpanda1:/var/lib/redpanda/data" \
 vectorized/redpanda start \
@@ -45,6 +70,8 @@ vectorized/redpanda start \
 --overprovisioned \
 --node-id 0 \
 --check=false \
+--pandaproxy-addr 0.0.0.0:8082 \
+--advertise-pandaproxy-addr 127.0.0.1:8082 \
 --kafka-addr 0.0.0.0:9092 \
 --advertise-kafka-addr 127.0.0.1:9092 \
 --rpc-addr 0.0.0.0:33145 \
@@ -64,6 +91,8 @@ vectorized/redpanda start \
 --node-id 1 \
 --seeds "redpanda-1:33145" \
 --check=false \
+--pandaproxy-addr 0.0.0.0:8083 \
+--advertise-pandaproxy-addr 127.0.0.1:8083 \
 --kafka-addr 0.0.0.0:9093 \
 --advertise-kafka-addr 127.0.0.1:9093 \
 --rpc-addr 0.0.0.0:33146 \
@@ -83,6 +112,8 @@ vectorized/redpanda start \
 --node-id 2 \
 --seeds "redpanda-1:33145" \
 --check=false \
+--pandaproxy-addr 0.0.0.0:8084 \
+--advertise-pandaproxy-addr 127.0.0.1:8084 \
 --kafka-addr 0.0.0.0:9094 \
 --advertise-kafka-addr 127.0.0.1:9094 \
 --rpc-addr 0.0.0.0:33147 \
@@ -153,15 +184,10 @@ docker stop redpanda-1 redpanda-2 redpanda-3
 docker rm redpanda-1 redpanda-2 redpanda-3
 ```
 
-You can delete the volumes that hold the data that was stored in the cluster with:
+If you set up volumes and a network, delete them with:
 
 ```bash
 docker volume rm redpanda1 redpanda2 redpanda3
-```
-
-You can delete the network that you created with:
-
-```bash
 docker network rm redpandanet
 ```
 

@@ -199,7 +199,7 @@ func RemoveNetwork(c Client) error {
 
 func CreateNode(
 	c Client,
-	nodeID, kafkaPort, rpcPort, metricsPort uint,
+	nodeID, kafkaPort, proxyPort, rpcPort, metricsPort uint,
 	netID string,
 	args ...string,
 ) (*NodeState, error) {
@@ -217,9 +217,16 @@ func CreateNode(
 	if err != nil {
 		return nil, err
 	}
+	pPort, err := nat.NewPort(
+		"tcp",
+		strconv.Itoa(config.DefaultProxyPort),
+	)
+	if err != nil {
+		return nil, err
+	}
 	metPort, err := nat.NewPort(
 		"tcp",
-		strconv.Itoa(config.Default().Redpanda.AdminApi.Port),
+		strconv.Itoa(config.DefaultAdminPort),
 	)
 	if err != nil {
 		return nil, err
@@ -235,10 +242,14 @@ func CreateNode(
 		fmt.Sprintf("%d", nodeID),
 		"--kafka-addr",
 		fmt.Sprintf("%s:%d", ip, config.DefaultKafkaPort),
+		"--pandaproxy-addr",
+		fmt.Sprintf("%s:%d", ip, config.DefaultProxyPort),
 		"--rpc-addr",
 		fmt.Sprintf("%s:%d", ip, config.Default().Redpanda.RPCServer.Port),
 		"--advertise-kafka-addr",
 		HostAddr(kafkaPort),
+		"--advertise-pandaproxy-addr",
+		HostAddr(proxyPort),
 		"--advertise-rpc-addr",
 		fmt.Sprintf("%s:%d", ip, config.Default().Redpanda.RPCServer.Port),
 		"--smp 1 --memory 1G --reserve-memory 0M",
@@ -249,6 +260,7 @@ func CreateNode(
 		Cmd:      append(cmd, args...),
 		ExposedPorts: nat.PortSet{
 			rPort: {},
+			pPort: {},
 			kPort: {},
 		},
 		Labels: map[string]string{
@@ -263,6 +275,9 @@ func CreateNode(
 			}},
 			kPort: []nat.PortBinding{{
 				HostPort: fmt.Sprint(kafkaPort),
+			}},
+			pPort: []nat.PortBinding{{
+				HostPort: fmt.Sprint(proxyPort),
 			}},
 			metPort: []nat.PortBinding{{
 				HostPort: fmt.Sprint(metricsPort),
