@@ -68,7 +68,7 @@ SEASTAR_THREAD_TEST_CASE(reserve_test) {
 SEASTAR_THREAD_TEST_CASE(simple_envelope_test) {
     struct msg
       : serde::envelope<msg, serde::version<1>, serde::compat_version<0>> {
-        uint32_t _i, _j;
+        int32_t _i, _j;
     };
 
     auto b = iobuf();
@@ -113,9 +113,8 @@ SEASTAR_THREAD_TEST_CASE(envelope_test_version_older_than_compat_version) {
         serde::read<test_msg1>(parser);
     } catch (std::system_error const& e) {
         BOOST_CHECK(
-          e.code()
-          == serde::make_error_code(
-            serde::error_codes::version_older_than_compat_version));
+          e.code() == serde::make_error_code(
+                        serde::error_codes::version_older_than_compat_version));
         throws = true;
     }
 
@@ -191,8 +190,14 @@ SEASTAR_THREAD_TEST_CASE(complex_msg_test) {
     serde::write(
       b,
       complex_msg{
-        ._vec = std::
-          vector{inner_differing_sizes{._ints = {1, 2, 3}}, big, inner_differing_sizes{._ints = {1, 2, 3}}, big, inner_differing_sizes{._ints = {1, 2, 3}}, big},
+        ._vec =
+          std::vector{
+            inner_differing_sizes{._ints = {1, 2, 3}},
+            big,
+            inner_differing_sizes{._ints = {1, 2, 3}},
+            big,
+            inner_differing_sizes{._ints = {1, 2, 3}},
+            big},
         ._x = 3});
 
     auto parser = iobuf_parser{std::move(b)};
@@ -212,11 +217,12 @@ struct test_snapshot_header
       test_snapshot_header,
       serde::version<1>,
       serde::compat_version<0>> {
-    ss::future<> serde_async_read(iobuf_parser&);
+    ss::future<>
+    serde_async_read(iobuf_parser&, serde::version_t, serde::version_t, size_t);
     ss::future<> serde_async_write(iobuf&) const;
 
-    uint32_t header_crc;
-    uint32_t metadata_crc;
+    int32_t header_crc;
+    int32_t metadata_crc;
     int8_t version;
     int32_t metadata_size;
 };
@@ -225,7 +231,8 @@ static_assert(serde::is_envelope_v<test_snapshot_header>);
 static_assert(serde::has_serde_async_read<test_snapshot_header>);
 static_assert(serde::has_serde_async_write<test_snapshot_header>);
 
-ss::future<> test_snapshot_header::serde_async_read(iobuf_parser& in) {
+ss::future<> test_snapshot_header::serde_async_read(
+  iobuf_parser& in, serde::version_t, serde::version_t, size_t) {
     header_crc = serde::read<decltype(header_crc)>(in);
     metadata_crc = serde::read<decltype(metadata_crc)>(in);
     version = serde::read<decltype(version)>(in);
@@ -259,13 +266,19 @@ ss::future<> test_snapshot_header::serde_async_write(iobuf& out) const {
 
 SEASTAR_THREAD_TEST_CASE(snapshot_test) {
     auto b = iobuf();
-    auto const write_future = serde::write_async(
+    auto write_future = serde::write_async(
       b,
       test_snapshot_header{
         .header_crc = 1, .metadata_crc = 2, .version = 3, .metadata_size = 4});
+    write_future.wait();
     auto parser = iobuf_parser{std::move(b)};
     auto read_future = serde::read_async<test_snapshot_header>(parser);
     read_future.wait();
     BOOST_CHECK(read_future.failed());
-    BOOST_CHECK(read_future.get_exception());
+    try {
+        std::rethrow_exception(read_future.get_exception());
+    } catch (std::exception const& e) {
+        BOOST_CHECK(
+          std::string_view{e.what()}.starts_with("Corrupt snapshot."));
+    }
 }
